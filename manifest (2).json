@@ -1,0 +1,16 @@
+{
+  "name": "P Food'z Cafe — Operations",
+  "short_name": "P Food'z Cafe",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#FFFBF3",
+  "theme_color": "#EA580C",
+  "icons": [
+    { "src": "https://res.cloudinary.com/dfjegeiip/image/upload/c_pad,w_192,h_192,b_rgb:FFFBF3/v1791224103/logo_n_qsftik.jpg", "sizes": "192x192", "type": "image/jpeg", "purpose": "any" },
+    { "src": "https://res.cloudinary.com/dfjegeiip/image/upload/c_pad,w_512,h_512,b_rgb:FFFBF3/v1791224103/logo_n_qsftik.jpg", "sizes": "512x512", "type": "image/jpeg", "purpose": "any" },
+    { "src": "https://res.cloudinary.com/dfjegeiip/image/upload/c_pad,w_135,h_135,b_rgb:FFFBF3/c_pad,w_192,h_192,b_rgb:FFFBF3/v1791224103/logo_n_qsftik.jpg", "sizes": "192x192", "type": "image/jpeg", "purpose": "maskable" },
+    { "src": "https://res.cloudinary.com/dfjegeiip/image/upload/c_pad,w_360,h_360,b_rgb:FFFBF3/c_pad,w_512,h_512,b_rgb:FFFBF3/v1791224103/logo_n_qsftik.jpg", "sizes": "512x512", "type": "image/jpeg", "purpose": "maskable" }
+  ]
+}
