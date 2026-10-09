@@ -27,10 +27,82 @@ function num(v) { const n = Number(v); return isNaN(n) ? 0 : n; }
 function round3(v) { return Math.round(v * 1000) / 1000; }
 function normH(s) { return String(s).toLowerCase().replace(/\s+/g, " ").trim(); }
 
-async function readRange(sheetName, range = "A1:ZZ5000") {
+// =================== DATE NORMALIZERS ===================
+// Google Sheets se FORMATTED_VALUE string deta hai (jaise "9/29/2026" ya "11:00 AM")
+// UNFORMATTED_VALUE serial number deta hai (jaise 45564.5) — dono ko ISO string mein convert karta hai
+function pad2(n) { return String(n).padStart(2, '0'); }
+function toISODate(d) { return d.getFullYear() + '-' + pad2(d.getMonth()+1) + '-' + pad2(d.getDate()); }
+
+// Kisi bhi format ki date ko "yyyy-MM-dd" mein badalta hai
+function normalizeDate(v) {
+  if (v === null || v === undefined || v === "") return "";
+  if (v instanceof Date) return toISODate(v);
+  const s = String(v).trim();
+  if (!s) return "";
+  // Already ISO (yyyy-mm-dd...)
+  if (/^\d{4}-\d{1,2}-\d{1,2}/.test(s)) return s.slice(0, 10);
+  // US format (M/D/YYYY)
+  const us = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (us) return `${us[3]}-${pad2(us[1])}-${pad2(us[2])}`;
+  // Serial number (Google Sheets date = days since 1899-12-30)
+  const n = Number(s);
+  if (!isNaN(n) && n > 20000 && n < 60000) {
+    const d = new Date(Date.UTC(1899, 11, 30) + n * 86400000);
+    return toISODate(d);
+  }
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return toISODate(d);
+  return "";
+}
+
+// DateTime ko ISO string "yyyy-MM-ddTHH:mm:ss" mein badalta hai
+// dateHint: agar cell mein sirf time hai, toh us date se combine karo
+function normalizeDateTime(v, dateHint) {
+  if (v === null || v === undefined || v === "") return "";
+  if (v instanceof Date) return v.toISOString().slice(0, 19);
+  const s = String(v).trim();
+  if (!s) return "";
+  // Already ISO with T
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return s.slice(0, 19);
+  // ISO date only
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) return d.toISOString().slice(0, 19);
+  }
+  // Serial number (may include time fraction)
+  const n = Number(s);
+  if (!isNaN(n) && n > 20000 && n < 60000) {
+    const ms = Date.UTC(1899, 11, 30) + n * 86400000;
+    return new Date(ms).toISOString().slice(0, 19);
+  }
+  // US format with time: "M/D/YYYY H:MM(:SS)? (AM|PM)?"
+  const usFull = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?/i);
+  if (usFull) {
+    let h = parseInt(usFull[4]);
+    const ap = (usFull[7] || "").toUpperCase();
+    if (ap === "PM" && h !== 12) h += 12;
+    if (ap === "AM" && h === 12) h = 0;
+    return `${usFull[3]}-${pad2(usFull[1])}-${pad2(usFull[2])}T${pad2(h)}:${usFull[5]}:${usFull[6] || "00"}`;
+  }
+  // Time only "HH:MM(:SS)? (AM|PM)?" — combine with dateHint
+  const tOnly = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?/i);
+  if (tOnly && dateHint) {
+    let h = parseInt(tOnly[1]);
+    const ap = (tOnly[4] || "").toUpperCase();
+    if (ap === "PM" && h !== 12) h += 12;
+    if (ap === "AM" && h === 12) h = 0;
+    return `${dateHint}T${pad2(h)}:${tOnly[2]}:${tOnly[3] || "00"}`;
+  }
+  // Fallback
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return d.toISOString().slice(0, 19);
+  return "";
+}
+
+async function readRange(sheetName, range = "A1:ZZ5000", renderOption = "UNFORMATTED_VALUE") {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID, range: `'${sheetName}'!${range}`,
-    valueRenderOption: "UNFORMATTED_VALUE",
+    valueRenderOption: renderOption,
   });
   return res.data.values || [];
 }
@@ -64,17 +136,24 @@ function rowsToObjects(rows) {
 
 // =================== READERS ===================
 async function readStaff() { return rowsToObjects(await readRange(S.STAFF)); }
+
 async function readDemands() {
-  const rows = await readRange(S.DEMAND, "A1:N500");
-  return rows.slice(1).reverse().map((r, i) => ({
-    _row: rows.length - i, "Demand ID": r[0], Timestamp: r[1], "Raised By": r[2], "Item Name": r[3],
-    Category: r[4], Unit: r[5], "Qty Requested": r[6], Status: r[7] || "Pending",
-    "Warehouse Stock After": r[8], Notes: r[9], "Approved Qty": r[10], "Approved At": r[11] || "",
-    Feedback: r[12] || "", "Feedback At": r[13] || "",
-  }));
+  const rows = await readRange(S.DEMAND, "A1:N500", "FORMATTED_VALUE");
+  return rows.slice(1).reverse().map((r, i) => {
+    const ts = normalizeDateTime(r[1]);
+    const appAt = normalizeDateTime(r[11]);
+    const fbAt = normalizeDateTime(r[13]);
+    return {
+      _row: rows.length - i, "Demand ID": r[0], Timestamp: ts, "Raised By": r[2], "Item Name": r[3],
+      Category: r[4], Unit: r[5], "Qty Requested": r[6], Status: r[7] || "Pending",
+      "Warehouse Stock After": r[8], Notes: r[9], "Approved Qty": r[10], "Approved At": appAt,
+      Feedback: r[12] || "", "Feedback At": fbAt,
+    };
+  });
 }
+
 async function readProducts() {
-  const rows = await readRange(S.PRODUCTS);
+  const rows = await readRange(S.PRODUCTS, "A1:ZZ5000", "FORMATTED_VALUE");
   if (rows.length < 2) return [];
   const H = rows[0].map(normH);
   const find = (pred, def) => { for (let i = 0; i < H.length; i++) if (H[i] && pred(H[i])) return i; return def; };
@@ -108,27 +187,68 @@ async function readProducts() {
       "Approved Demand Qty by supervisor": approved, "Purchase Stock  QTy": purchase,
       "Current Stock": currentPcs, "Current Stock In Carton": round3(currentPcs / suq),
       Min: r[C.MIN], Max: r[C.MAX], Vendor: r[C.VENDOR] || "",
-      Rate: r[C.RATE], "Unit of rate": r[C.RATEUNIT] || "", "Expiry Date": r[C.EXPIRY] || "",
+      Rate: r[C.RATE], "Unit of rate": r[C.RATEUNIT] || "",
+      "Expiry Date": normalizeDate(r[C.EXPIRY]),
       "Base Unit": r[C.BASEUNIT] || r[C.UNIT] || "", "1 Stock Unit = (Base Qty)": suq,
       "Stock Type": r[C.STOCKTYPE] || "Stocked",
     });
   }
   return out;
 }
+
 async function readWarehouseEntries() {
-  const rows = await readRange(S.WHLOG);
-  return rowsToObjects(rows).slice(-200).reverse();
+  const rows = await readRange(S.WHLOG, "A1:ZZ500", "FORMATTED_VALUE");
+  const objs = rowsToObjects(rows);
+  objs.forEach(o => {
+    o['Timestamp'] = normalizeDateTime(o['Timestamp']);
+    o['Expiry Date'] = normalizeDate(o['Expiry Date']);
+    o['Last Edited'] = normalizeDateTime(o['Last Edited']);
+  });
+  return objs.slice(-200).reverse();
 }
+
 async function readCylinderEntries() {
-  const rows = await readRange(S.CYLINDER);
-  return rowsToObjects(rows).slice(-200).reverse();
+  const rows = await readRange(S.CYLINDER, "A1:ZZ500", "FORMATTED_VALUE");
+  const objs = rowsToObjects(rows);
+  objs.forEach(o => { o['Timestamp'] = normalizeDateTime(o['Timestamp']); });
+  return objs.slice(-200).reverse();
 }
-async function readPO() { return rowsToObjects(await readRange(S.PO)); }
+
+async function readPO() {
+  const rows = await readRange(S.PO, "A1:ZZ2000", "FORMATTED_VALUE");
+  const objs = rowsToObjects(rows);
+  objs.forEach(o => {
+    o['Timestamp'] = normalizeDateTime(o['Timestamp']);
+    o['Expiry Date'] = normalizeDate(o['Expiry Date']);
+  });
+  return objs;
+}
+
 async function readManualPurchases() {
-  const rows = await readRange(S.PO);
-  return rowsToObjects(rows).filter(r => String(r["PO ID"]).indexOf("MPO-") === 0).slice(-400).reverse();
+  const objs = await readPO();
+  return objs.filter(r => String(r["PO ID"]).indexOf("MPO-") === 0).slice(-400).reverse();
 }
-async function readAttendance() { return rowsToObjects(await readRange(S.ATTENDANCE)); }
+
+async function readAttendance() {
+  const rows = await readRange(S.ATTENDANCE, "A1:R2000", "FORMATTED_VALUE");
+  if (rows.length < 2) return [];
+  const headers = rows[0].map(h => String(h).trim());
+  const out = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const obj = { _row: i + 2 };
+    headers.forEach((h, idx) => { if (h) obj[h] = r[idx]; });
+    // Normalize dates/times
+    obj['Date'] = normalizeDate(obj['Date']);
+    obj['IN Time'] = normalizeDateTime(obj['IN Time'], obj['Date']);
+    obj['OUT Time'] = normalizeDateTime(obj['OUT Time'], obj['Date']);
+    // Skip empty rows
+    if (!obj['User ID'] && !obj['Date']) continue;
+    out.push(obj);
+  }
+  return out;
+}
+
 async function readVendors() {
   const products = await cached("products", readProducts);
   const names = new Set(Object.keys(VENDOR_ITEMS));
@@ -137,6 +257,7 @@ async function readVendors() {
   if (extra) { try { JSON.parse(extra).forEach(v => { if (v) names.add(v); }); } catch (e) {} }
   return [...names].sort();
 }
+
 async function readSettings() {
   const rows = await readRange(S.SETTINGS);
   const map = {};
@@ -149,12 +270,11 @@ async function getSetting(key, def) {
   return v === undefined ? def : v;
 }
 async function setSetting(key, val) {
-  const sh = S.SETTINGS;
-  const rows = await readRange(sh);
+  const rows = await readRange(S.SETTINGS);
   const objs = rowsToObjects(rows);
   const match = objs.find(r => String(r.Key).trim() === key);
-  if (match) await writeCell(sh, match._row, 2, val);
-  else await appendRow(sh, [key, val]);
+  if (match) await writeCell(S.SETTINGS, match._row, 2, val);
+  else await appendRow(S.SETTINGS, [key, val]);
   cache.del("settings");
 }
 
@@ -202,16 +322,16 @@ async function handleBootstrap(p) {
   const want = p.want || [];
   const out = { products: [], demands: [], staff: [], myAttendance: [], allAttendance: [], vendors: [], stats: null, poll: null };
   const tasks = [];
-  if (want.includes("products")) tasks.push(cached("products", readProducts).then(d => out.products = d).catch(() => {}));
-  if (want.includes("demands")) tasks.push(cached("demands", readDemands).then(d => out.demands = d).catch(() => {}));
-  if (want.includes("staff")) tasks.push(cached("staff", readStaff).then(d => out.staff = d).catch(() => {}));
-  if (want.includes("vendors")) tasks.push(cached("vendors", readVendors).then(d => out.vendors = d).catch(() => {}));
-  if (want.includes("stats")) tasks.push(buildDashboardStats().then(d => out.stats = d).catch(() => {}));
+  if (want.includes("products")) tasks.push(cached("products", readProducts).then(d => out.products = d).catch(e => console.error("products err:", e.message)));
+  if (want.includes("demands")) tasks.push(cached("demands", readDemands).then(d => out.demands = d).catch(e => console.error("demands err:", e.message)));
+  if (want.includes("staff")) tasks.push(cached("staff", readStaff).then(d => out.staff = d).catch(e => console.error("staff err:", e.message)));
+  if (want.includes("vendors")) tasks.push(cached("vendors", readVendors).then(d => out.vendors = d).catch(e => console.error("vendors err:", e.message)));
+  if (want.includes("stats")) tasks.push(buildDashboardStats().then(d => out.stats = d).catch(e => console.error("stats err:", e.message)));
   if (want.includes("myAttendance") || want.includes("allAttendance")) {
     tasks.push(cached("attendance", readAttendance).then(d => {
-      if (want.includes("myAttendance")) out.myAttendance = d.filter(r => String(r["User ID"]) === String(p.userId));
+      if (want.includes("myAttendance")) out.myAttendance = d.filter(r => String(r["User ID"]).toLowerCase().trim() === String(p.userId).toLowerCase().trim());
       if (want.includes("allAttendance")) out.allAttendance = d;
-    }).catch(() => {}));
+    }).catch(e => console.error("attendance err:", e.message)));
   }
   await Promise.all(tasks);
   try { out.poll = await buildPoll(); } catch (e) {}
@@ -234,9 +354,18 @@ async function buildDashboardStats() {
   const demands = await cached("demands", readDemands);
   const pos = await cached("po", readPO);
   const staff = await cached("staff", readStaff);
-  const tz = "Asia/Kolkata";
-  const today = new Date().toISOString().slice(0,10);
-  const presentIds = new Set(attendance.filter(a => String(a.Date || "").slice(0,10) === today && a["IN Time"]).map(a => a["User ID"]));
+
+  // Aaj ka business day (India timezone)
+  const now = new Date();
+  const istNow = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
+  const today = istNow.toISOString().slice(0, 10);
+
+  const presentIds = new Set(
+    attendance.filter(a => {
+      const d = String(a.Date || "").slice(0, 10);
+      return d === today && a["IN Time"];
+    }).map(a => a["User ID"])
+  );
   const totalStaff = staff.filter(s => s.Permission !== "Admin" && s.Permission !== "SuperAdmin").length;
   const health = { healthy: 0, low: 0, overstock: 0 };
   const categoryStock = {};
@@ -250,21 +379,21 @@ async function buildDashboardStats() {
   });
   const trend = [];
   for (let i = 6; i >= 0; i--) {
-    const d = new Date(); d.setDate(d.getDate() - i);
-    const key = d.toISOString().slice(0,10);
-    const ids = new Set(attendance.filter(a => String(a.Date || "").slice(0,10) === key && a["IN Time"]).map(a => a["User ID"]));
+    const d = new Date(istNow); d.setDate(d.getDate() - i);
+    const key = d.toISOString().slice(0, 10);
+    const ids = new Set(attendance.filter(a => String(a.Date || "").slice(0, 10) === key && a["IN Time"]).map(a => a["User ID"]));
     trend.push({ date: key, present: ids.size });
   }
   const poStatus = { Pending: 0, Ordered: 0, Received: 0, Cancelled: 0 };
   pos.forEach(p => { const s = String(p.Status || "").trim(); if (poStatus.hasOwnProperty(s)) poStatus[s]++; else if (s.indexOf("Received") === 0) poStatus.Received++; });
-  const topDemandItems = products.map(p => ({ name: p["Item Name (Standardized)"], demand: num(p["Deman for canteen"]) })).filter(p => p.demand > 0).sort((a,b) => b.demand - a.demand).slice(0,5);
+  const topDemandItems = products.map(p => ({ name: p["Item Name (Standardized)"], demand: num(p["Deman for canteen"]) })).filter(p => p.demand > 0).sort((a, b) => b.demand - a.demand).slice(0, 5);
   return {
     totalStaff, presentToday: presentIds.size, absentToday: Math.max(totalStaff - presentIds.size, 0),
     totalProducts: products.length, lowStockCount: health.low,
     pendingDemands: demands.filter(d => d.Status === "Pending").length,
     pendingPOs: pos.filter(p => p.Status === "Pending").length,
     attendanceTrend: trend, categoryStock,
-    lateToday: attendance.filter(a => String(a.Date || "").slice(0,10) === today && a["IN Status"] === "Late").length,
+    lateToday: attendance.filter(a => String(a.Date || "").slice(0, 10) === today && a["IN Status"] === "Late").length,
     stockHealth: health, poStatus, topDemandItems,
   };
 }
@@ -316,7 +445,7 @@ app.all("/", async (req, res) => {
     else if (action === "getManualPurchases") data = await cached("mpo", readManualPurchases);
     else if (action === "getAttendance") {
       let att = await cached("attendance", readAttendance);
-      if (payload.userId) att = att.filter(r => String(r["User ID"]) === String(payload.userId));
+      if (payload.userId) att = att.filter(r => String(r["User ID"]).toLowerCase().trim() === String(payload.userId).toLowerCase().trim());
       data = att;
     }
     else if (action === "addDemand") data = await handleAddDemand(payload);
@@ -329,7 +458,6 @@ app.all("/", async (req, res) => {
   }
 });
 async function readPOBatches() {
-  const poSh = S.PO;
   const pos = (await cached("po", readPO)).filter(po => po.Status !== "Cancelled");
   const batches = {};
   pos.forEach(po => {
