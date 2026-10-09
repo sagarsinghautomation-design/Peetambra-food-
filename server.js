@@ -6,7 +6,7 @@ const cors = require("cors");
 const app = express();
 app.use(cors());
 app.use(express.urlencoded({ extended: true }));
-app.use(express.json({ limit: "20mb", type: ['application/json', 'text/plain'] }));
+app.use(express.json({ limit: "20mb", type: ["application/json", "text/plain"] }));
 
 const cache = new NodeCache({ stdTTL: 120, checkperiod: 30 });
 
@@ -16,6 +16,7 @@ const auth = new google.auth.GoogleAuth({
 });
 const sheets = google.sheets({ version: "v4", auth });
 const SHEET_ID = process.env.SHEET_ID;
+const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL || "";
 
 const S = {
   PRODUCTS: "Product & Stock Master", ATTENDANCE: "Attendance", DEMAND: "Demand",
@@ -23,28 +24,21 @@ const S = {
   CYLINDER: "Cylinder Entry", SETTINGS: "Settings",
 };
 
+// =================== HELPERS ===================
 function num(v) { const n = Number(v); return isNaN(n) ? 0 : n; }
 function round3(v) { return Math.round(v * 1000) / 1000; }
 function normH(s) { return String(s).toLowerCase().replace(/\s+/g, " ").trim(); }
+function pad2(n) { return String(n).padStart(2, "0"); }
+function toISODate(d) { return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
 
-// =================== DATE NORMALIZERS ===================
-// Google Sheets se FORMATTED_VALUE string deta hai (jaise "9/29/2026" ya "11:00 AM")
-// UNFORMATTED_VALUE serial number deta hai (jaise 45564.5) — dono ko ISO string mein convert karta hai
-function pad2(n) { return String(n).padStart(2, '0'); }
-function toISODate(d) { return d.getFullYear() + '-' + pad2(d.getMonth()+1) + '-' + pad2(d.getDate()); }
-
-// Kisi bhi format ki date ko "yyyy-MM-dd" mein badalta hai
 function normalizeDate(v) {
   if (v === null || v === undefined || v === "") return "";
   if (v instanceof Date) return toISODate(v);
   const s = String(v).trim();
   if (!s) return "";
-  // Already ISO (yyyy-mm-dd...)
   if (/^\d{4}-\d{1,2}-\d{1,2}/.test(s)) return s.slice(0, 10);
-  // US format (M/D/YYYY)
   const us = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
   if (us) return `${us[3]}-${pad2(us[1])}-${pad2(us[2])}`;
-  // Serial number (Google Sheets date = days since 1899-12-30)
   const n = Number(s);
   if (!isNaN(n) && n > 20000 && n < 60000) {
     const d = new Date(Date.UTC(1899, 11, 30) + n * 86400000);
@@ -55,27 +49,21 @@ function normalizeDate(v) {
   return "";
 }
 
-// DateTime ko ISO string "yyyy-MM-ddTHH:mm:ss" mein badalta hai
-// dateHint: agar cell mein sirf time hai, toh us date se combine karo
 function normalizeDateTime(v, dateHint) {
   if (v === null || v === undefined || v === "") return "";
   if (v instanceof Date) return v.toISOString().slice(0, 19);
   const s = String(v).trim();
   if (!s) return "";
-  // Already ISO with T
   if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return s.slice(0, 19);
-  // ISO date only
   if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
     const d = new Date(s);
     if (!isNaN(d.getTime())) return d.toISOString().slice(0, 19);
   }
-  // Serial number (may include time fraction)
   const n = Number(s);
   if (!isNaN(n) && n > 20000 && n < 60000) {
     const ms = Date.UTC(1899, 11, 30) + n * 86400000;
     return new Date(ms).toISOString().slice(0, 19);
   }
-  // US format with time: "M/D/YYYY H:MM(:SS)? (AM|PM)?"
   const usFull = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?/i);
   if (usFull) {
     let h = parseInt(usFull[4]);
@@ -84,7 +72,6 @@ function normalizeDateTime(v, dateHint) {
     if (ap === "AM" && h === 12) h = 0;
     return `${usFull[3]}-${pad2(usFull[1])}-${pad2(usFull[2])}T${pad2(h)}:${usFull[5]}:${usFull[6] || "00"}`;
   }
-  // Time only "HH:MM(:SS)? (AM|PM)?" — combine with dateHint
   const tOnly = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?/i);
   if (tOnly && dateHint) {
     let h = parseInt(tOnly[1]);
@@ -93,7 +80,6 @@ function normalizeDateTime(v, dateHint) {
     if (ap === "AM" && h === 12) h = 0;
     return `${dateHint}T${pad2(h)}:${tOnly[2]}:${tOnly[3] || "00"}`;
   }
-  // Fallback
   const d = new Date(s);
   if (!isNaN(d.getTime())) return d.toISOString().slice(0, 19);
   return "";
@@ -238,24 +224,13 @@ async function readAttendance() {
     const r = rows[i];
     const obj = { _row: i + 2 };
     headers.forEach((h, idx) => { if (h) obj[h] = r[idx]; });
-    // Normalize dates/times
     obj['Date'] = normalizeDate(obj['Date']);
     obj['IN Time'] = normalizeDateTime(obj['IN Time'], obj['Date']);
     obj['OUT Time'] = normalizeDateTime(obj['OUT Time'], obj['Date']);
-    // Skip empty rows
     if (!obj['User ID'] && !obj['Date']) continue;
     out.push(obj);
   }
   return out;
-}
-
-async function readVendors() {
-  const products = await cached("products", readProducts);
-  const names = new Set(Object.keys(VENDOR_ITEMS));
-  products.forEach((p) => { const v = String(p.Vendor || "").trim(); if (v) names.add(v); });
-  const extra = await getSetting("ExtraVendors", "");
-  if (extra) { try { JSON.parse(extra).forEach(v => { if (v) names.add(v); }); } catch (e) {} }
-  return [...names].sort();
 }
 
 async function readSettings() {
@@ -278,6 +253,15 @@ async function setSetting(key, val) {
   cache.del("settings");
 }
 
+async function readVendors() {
+  const products = await cached("products", readProducts);
+  const names = new Set(Object.keys(VENDOR_ITEMS));
+  products.forEach((p) => { const v = String(p.Vendor || "").trim(); if (v) names.add(v); });
+  const extra = await getSetting("ExtraVendors", "");
+  if (extra) { try { JSON.parse(extra).forEach(v => { if (v) names.add(v); }); } catch (e) {} }
+  return [...names].sort();
+}
+
 const VENDOR_ITEMS = {
   "Mauranipur (Shivam Sahu)": ["tel tin","nariyal","chabal","dal","haldi","lal mirch powder","dhaniya powder","namak","nirma","khatta meetha","aalu bhujia","navratan","bhel","kaju","magaj","meet masala","kichin king","chat masala","jeera powder masala","papad","jeera","nisree","green chilli","vinegar","red chilli","heeng","hani","gulab jal","methi","aajban","ararot","idli powder","ajinomoto","kali mirch powder","peanut","chole","long","sarso tel botal","imli","sambhar masala","white pepper","kastoori maithi","red kalar","green kalar","lal mirch khadi","khada dhaniya"],
   "Bada Bazar": ["kale dibba","combo","nepkin","spoon","clean wrap","silver rol","french fries lifafa","stro","chatni dibbi badi","lakdi chammach","chay gilas chote","chay gilas bade","pani gilas"],
@@ -290,7 +274,7 @@ function matchVendorForItem(name) {
 }
 
 async function cached(key, builder) {
-  const hit = cache.get(key); if (hit) return hit;
+  const hit = cache.get(key); if (hit !== undefined) return hit;
   const data = await builder(); cache.set(key, data); return data;
 }
 function invalidate(...keys) { keys.forEach(k => cache.del(k)); }
@@ -318,6 +302,7 @@ async function handleLogin(p) {
   } catch (e) { console.error("Bootstrap error:", e.message); result.bootstrap = {}; }
   return result;
 }
+
 async function handleBootstrap(p) {
   const want = p.want || [];
   const out = { products: [], demands: [], staff: [], myAttendance: [], allAttendance: [], vendors: [], stats: null, poll: null };
@@ -337,6 +322,7 @@ async function handleBootstrap(p) {
   try { out.poll = await buildPoll(); } catch (e) {}
   return out;
 }
+
 async function buildPoll() {
   const demands = await cached("demands", readDemands);
   let pending = 0, newest = null;
@@ -348,23 +334,18 @@ async function buildPoll() {
   });
   return { ver: Date.now(), pending, newest: newest ? { item: newest["Item Name"], qty: newest["Qty Requested"], unit: newest.Unit, by: newest["Raised By"] } : null };
 }
+
 async function buildDashboardStats() {
   const products = (await cached("products", readProducts)).filter(p => String(p["Item Name (Standardized)"] || "").trim() !== "");
   const attendance = (await cached("attendance", readAttendance)).slice(-700);
   const demands = await cached("demands", readDemands);
   const pos = await cached("po", readPO);
   const staff = await cached("staff", readStaff);
-
-  // Aaj ka business day (India timezone)
   const now = new Date();
   const istNow = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
   const today = istNow.toISOString().slice(0, 10);
-
   const presentIds = new Set(
-    attendance.filter(a => {
-      const d = String(a.Date || "").slice(0, 10);
-      return d === today && a["IN Time"];
-    }).map(a => a["User ID"])
+    attendance.filter(a => String(a.Date || "").slice(0, 10) === today && a["IN Time"]).map(a => a["User ID"])
   );
   const totalStaff = staff.filter(s => s.Permission !== "Admin" && s.Permission !== "SuperAdmin").length;
   const health = { healthy: 0, low: 0, overstock: 0 };
@@ -398,12 +379,14 @@ async function buildDashboardStats() {
   };
 }
 
+// =================== DEMAND HANDLERS ===================
 async function handleAddDemand(p) {
   const products = await cached("products", readProducts);
   const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(p.itemName));
-  if (!item) throw new Error("Item not found");
-  const id = "DMD-" + Date.now();
-  await appendRow(S.DEMAND, [id, new Date().toISOString(), p.raisedBy, p.itemName, p.category || item.Category, p.unit || item.Unit, p.qty, "Pending", "", p.notes || "", "", "", "", ""]);
+  if (!item) throw new Error("Item not found: " + p.itemName);
+  const id = "DMD-" + Date.now() + "-" + Math.floor(Math.random() * 90 + 10);
+  const ts = new Date().toISOString();
+  await appendRow(S.DEMAND, [id, ts, p.raisedBy || "", p.itemName, p.category || item.Category || "", p.unit || item.Unit || "", Number(p.qty) || 0, "Pending", "", p.notes || "", "", "", "", ""]);
   if (item._row) {
     const newDemand = num(item["Deman for canteen"]) + num(p.qty);
     await writeCell(S.PRODUCTS, item._row, 8, newDemand);
@@ -411,52 +394,321 @@ async function handleAddDemand(p) {
   invalidate("demands", "products", "dash");
   return { id, row: 0 };
 }
-async function handleApproveDemand(p) {
-  const row = Number(p.row); const approved = num(p.approvedQty);
-  await writeCell(S.DEMAND, row, 8, "Approved");
-  await writeCell(S.DEMAND, row, 11, approved);
-  await writeCell(S.DEMAND, row, 12, new Date().toISOString());
+
+async function handleApproveDemands(p) {
+  const items = Array.isArray(p.items) ? p.items : [];
+  if (!items.length) throw new Error("Koi demand select nahi hui.");
+  const results = [];
+  for (const it of items) {
+    try {
+      const row = Number(it.row);
+      if (!row || row < 2) throw new Error("Invalid row");
+      const approved = Number(it.approvedQty);
+      const feedback = (it.feedback || "").trim();
+      const nowIso = new Date().toISOString();
+      await writeCell(S.DEMAND, row, 8, "Approved");
+      await writeCell(S.DEMAND, row, 11, isNaN(approved) ? "" : approved);
+      await writeCell(S.DEMAND, row, 12, nowIso);
+      if (feedback) {
+        await writeCell(S.DEMAND, row, 13, feedback);
+        await writeCell(S.DEMAND, row, 14, nowIso);
+      }
+      results.push({ row, ok: true, approvedQty: approved });
+    } catch (e) { results.push({ row: it.row, ok: false, error: e.message }); }
+  }
   invalidate("demands", "products", "dash");
+  return { results };
+}
+
+async function handleRejectDemands(p) {
+  const rows = Array.isArray(p.rows) ? p.rows.map(Number) : [];
+  if (!rows.length) throw new Error("Koi demand select nahi hui.");
+  const results = [];
+  for (const row of rows) {
+    try {
+      if (!row || row < 2) throw new Error("Invalid row");
+      await writeCell(S.DEMAND, row, 8, "Rejected");
+      results.push({ row, ok: true });
+    } catch (e) { results.push({ row, ok: false, error: e.message }); }
+  }
+  invalidate("demands", "products", "dash");
+  return { results };
+}
+
+async function handleEditDemand(p) {
+  const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
+  const newQty = Number(p.newQty); if (isNaN(newQty) || newQty <= 0) throw new Error("Invalid quantity");
+  await writeCell(S.DEMAND, row, 7, newQty);
+  invalidate("demands");
+  return { row };
+}
+
+async function handleDeleteDemand(p) {
+  const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
+  await writeCell(S.DEMAND, row, 8, "Cancelled");
+  invalidate("demands", "products", "dash");
+  return { row };
+}
+
+async function handleSaveDemandFeedback(p) {
+  const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
+  const feedback = String(p.feedback || "").trim().slice(0, 500);
+  if (!feedback) throw new Error("Feedback khali hai");
+  const nowIso = new Date().toISOString();
+  await writeCell(S.DEMAND, row, 13, feedback);
+  await writeCell(S.DEMAND, row, 14, nowIso);
+  invalidate("demands");
+  return { row, feedback, feedbackAt: nowIso };
+}
+
+// =================== ATTENDANCE HANDLERS ===================
+function businessDateKey(d) {
+  const now = new Date(d);
+  const ist = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
+  const hour = ist.getUTCHours();
+  if (hour < 3) ist.setUTCDate(ist.getUTCDate() - 1);
+  return ist.toISOString().slice(0, 10);
+}
+
+async function handleMarkAttendance(p) {
+  const now = new Date();
+  const dateStr = businessDateKey(now);
+  const type = p.type === "OUT" ? "OUT" : "IN";
+
+  let photoUrl = "";
+  if (p.photoBase64 && APPS_SCRIPT_URL) {
+    try {
+      const r = await fetch(APPS_SCRIPT_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "uploadPhoto", photoBase64: p.photoBase64, userId: p.userId, name: p.userId }) });
+      const j = await r.json();
+      photoUrl = (j && (j.url || (j.data && j.data.url))) || "";
+    } catch (e) { console.error("Photo upload:", e.message); }
+  }
+
+  const rows = await readRange(S.ATTENDANCE, "A1:R2000", "FORMATTED_VALUE");
+  if (rows.length < 1) throw new Error("Attendance sheet khaali hai");
+  const headers = rows[0].map(h => String(h).trim());
+  const ci = {}; headers.forEach((h, i) => { ci[h] = i; });
+
+  let todayRow = -1;
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (String(r[ci["User ID"]] || "").trim() === String(p.userId).trim() && normalizeDate(r[ci["Date"]]) === dateStr) { todayRow = i + 1; break; }
+  }
+
+  const mapsLink = (p.lat && p.lng) ? ("https://www.google.com/maps?q=" + p.lat + "," + p.lng) : "";
+  const nowIso = now.toISOString();
+  const nowTimeStr = now.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true });
+  let status = "Marked";
+
+  if (type === "IN") {
+    if (todayRow > 0 && rows[todayRow - 1][ci["IN Time"]]) throw new Error("Aap already IN punch kar chuke ho.");
+    await appendRow(S.ATTENDANCE, [dateStr, p.userId, p.name || "", p.designation || "", p.shift || "", nowIso, photoUrl, mapsLink, p.lat || "", p.lng || "", status, "", "", "", "", "", "", "Present"]);
+  } else {
+    if (todayRow <= 0) throw new Error("Pehle IN punch karo.");
+    await writeCell(S.ATTENDANCE, todayRow, ci["OUT Time"] + 1, nowIso);
+    await writeCell(S.ATTENDANCE, todayRow, ci["OUT Photo URL"] + 1, photoUrl);
+    await writeCell(S.ATTENDANCE, todayRow, ci["OUT Maps Link"] + 1, mapsLink);
+    await writeCell(S.ATTENDANCE, todayRow, ci["OUT Latitude"] + 1, p.lat || "");
+    await writeCell(S.ATTENDANCE, todayRow, ci["OUT Longitude"] + 1, p.lng || "");
+    await writeCell(S.ATTENDANCE, todayRow, ci["OUT Status"] + 1, status);
+  }
+  invalidate("attendance", "dash");
+  return { status, type, photoUrl };
+}
+
+async function handleEditAttendancePunch(p) {
+  const rows = await readRange(S.ATTENDANCE, "A1:R2000", "FORMATTED_VALUE");
+  const headers = rows[0].map(h => String(h).trim());
+  const ci = {}; headers.forEach((h, i) => { ci[h] = i; });
+  const note = "Manually corrected by " + (p.editedBy || "SuperAdmin");
+  let ex = -1;
+  for (let i = 1; i < rows.length; i++) {
+    if (String(rows[i][ci["User ID"]] || "").trim() === String(p.userId).trim() && normalizeDate(rows[i][ci["Date"]]) === p.dateISO) { ex = i + 1; break; }
+  }
+  if (p.inTime) {
+    const ts = p.dateISO + "T" + p.inTime + ":00";
+    if (ex > 0) {
+      await writeCell(S.ATTENDANCE, ex, ci["IN Time"] + 1, ts);
+      await writeCell(S.ATTENDANCE, ex, ci["IN Photo URL"] + 1, note);
+    } else {
+      await appendRow(S.ATTENDANCE, [p.dateISO, p.userId, p.name, p.designation, p.shift, ts, note, "", "", "", "Marked", "", "", "", "", "", "", "Present"]);
+    }
+  }
+  if (p.outTime) {
+    const rows2 = await readRange(S.ATTENDANCE, "A1:R2000", "FORMATTED_VALUE");
+    let ex2 = -1;
+    for (let i = 1; i < rows2.length; i++) {
+      if (String(rows2[i][ci["User ID"]] || "").trim() === String(p.userId).trim() && normalizeDate(rows2[i][ci["Date"]]) === p.dateISO) { ex2 = i + 1; break; }
+    }
+    if (ex2 <= 0) throw new Error("Pehle IN set karo");
+    const ts = p.dateISO + "T" + p.outTime + ":00";
+    await writeCell(S.ATTENDANCE, ex2, ci["OUT Time"] + 1, ts);
+    await writeCell(S.ATTENDANCE, ex2, ci["OUT Photo URL"] + 1, note);
+  }
+  invalidate("attendance", "dash");
   return { ok: true };
 }
 
-// =================== ROUTER ===================
-app.all("/", async (req, res) => {
-  const payload = { ...req.query, ...req.body };
-  const action = payload.action;
-  if (!action) return res.json({ ok: true, service: "Peetambra Bridge Running" });
-  try {
-    let data;
-    if (action === "login") data = await handleLogin(payload);
-    else if (action === "bootstrap") data = await handleBootstrap(payload);
-    else if (action === "poll") data = await buildPoll();
-    else if (action === "getProducts") data = await cached("products", readProducts);
-    else if (action === "getCategories") data = [...new Set((await cached("products", readProducts)).map(p => p.Category).filter(Boolean))].sort();
-    else if (action === "getStaff") data = await cached("staff", readStaff);
-    else if (action === "getVendors") data = await cached("vendors", readVendors);
-    else if (action === "getDemands") data = await cached("demands", readDemands);
-    else if (action === "getDashboardStats") data = await buildDashboardStats();
-    else if (action === "getLowStockAlerts") { const products = await cached("products", readProducts); data = products.filter(p => { const min = num(p.Min), max = num(p.Max), cur = num(p["Current Stock In Carton"]); return (min > 0 && cur <= min) || (max > 0 && cur >= max); }).map(p => ({ "Item Name": p["Item Name (Standardized)"], Category: p.Category, Unit: p.Unit, "Current Stock": p["Current Stock"], "Min Stock": p.Min, "Max Stock": p.Max, "Status": (num(p.Min) > 0 && num(p["Current Stock In Carton"]) <= num(p.Min)) ? "LOW" : "OVERSTOCK" })); }
-    else if (action === "getWarehouseEntries") data = await cached("whlog", readWarehouseEntries);
-    else if (action === "getCylinderEntries") data = await cached("cyl", readCylinderEntries);
-    else if (action === "getCylinderPrice") data = Number(await getSetting("CylinderPrice", "2900")) || 2900;
-    else if (action === "getPOBatches") data = await cached("po_batches", readPOBatches);
-    else if (action === "getPurchaseOrders") data = await cached("po", readPO);
-    else if (action === "getManualPurchases") data = await cached("mpo", readManualPurchases);
-    else if (action === "getAttendance") {
-      let att = await cached("attendance", readAttendance);
-      if (payload.userId) att = att.filter(r => String(r["User ID"]).toLowerCase().trim() === String(payload.userId).toLowerCase().trim());
-      data = att;
-    }
-    else if (action === "addDemand") data = await handleAddDemand(payload);
-    else if (action === "approveDemand") data = await handleApproveDemand(payload);
-    else data = { note: "Action not implemented yet: " + action };
-    res.json({ ok: true, data });
-  } catch (e) {
-    console.error("Router error on action", action, ":", e.message);
-    res.json({ ok: false, error: e.message });
+// =================== WAREHOUSE HANDLERS ===================
+async function handleAddWarehouseEntry(p) {
+  const products = await cached("products", readProducts);
+  const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(p.itemName || p.newName));
+  if (!item) throw new Error("Item not found");
+  const qty = Number(p.qty) || 0; if (qty <= 0) throw new Error("Invalid quantity");
+  const newLoose = round3(num(item["W/H Opening Loose"]) + qty);
+  await writeCell(S.PRODUCTS, item._row, 7, newLoose);
+  if (p.rate) await writeCell(S.PRODUCTS, item._row, 17, Number(p.rate));
+  if (p.expiryDate) await writeCell(S.PRODUCTS, item._row, 19, p.expiryDate);
+  await appendRow(S.WHLOG, ["WH-" + Date.now(), new Date().toISOString(), item["Item Name (Standardized)"], "add", qty, item["Current Stock"], round3(num(item["Current Stock"]) + qty), p.enteredBy || "", ""]);
+  invalidate("products", "whlog", "dash");
+  return { itemName: item["Item Name (Standardized)"], newValue: round3(num(item["Current Stock"]) + qty) };
+}
+async function handleEditWarehouseEntry(p) {
+  const row = Number(p.logRow); if (!row || row < 2) throw new Error("Invalid row");
+  await writeCell(S.WHLOG, row, 5, Number(p.newQty) || 0);
+  await writeCell(S.WHLOG, row, 9, new Date().toISOString());
+  invalidate("whlog", "products", "dash");
+  return { row };
+}
+async function handleDeleteWarehouseEntry(p) {
+  const row = Number(p.logRow); if (!row || row < 2) throw new Error("Invalid row");
+  await writeCell(S.WHLOG, row, 8, "Cancelled");
+  invalidate("whlog", "products", "dash");
+  return { row };
+}
+
+// =================== CYLINDER HANDLERS ===================
+async function handleAddCylinderEntry(p) {
+  const qty = Number(p.qty) || 0; if (qty <= 0) throw new Error("Invalid quantity");
+  const price = Number(await getSetting("CylinderPrice", "2900")) || 2900;
+  const total = qty * price;
+  let photoUrl = "";
+  if (p.photoBase64 && APPS_SCRIPT_URL) {
+    try {
+      const r = await fetch(APPS_SCRIPT_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "uploadPhoto", photoBase64: p.photoBase64, userId: "cyl_" + Date.now(), name: "cyl" }) });
+      const j = await r.json();
+      photoUrl = (j && (j.url || (j.data && j.data.url))) || "";
+    } catch (e) {}
   }
-});
+  await appendRow(S.CYLINDER, ["CYL-" + Date.now(), new Date().toISOString(), p.receivedBy || "", qty, price, total, photoUrl]);
+  invalidate("cyl", "dash");
+  return { qty, price, total, photoUrl };
+}
+
+// =================== PO HANDLERS ===================
+async function handleAddPurchaseOrder(p) {
+  await appendRow(S.PO, ["PO-" + Date.now(), new Date().toISOString(), p.itemName, p.category || "", p.unit || "", Number(p.qty) || 0, "Pending", p.requestedBy || "", p.notes || ""]);
+  invalidate("po", "po_batches");
+  return { id: "PO-" + Date.now() };
+}
+async function handleCancelPO(p) {
+  const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
+  await writeCell(S.PO, row, 7, "Cancelled");
+  invalidate("po", "po_batches");
+  return { row };
+}
+async function handleClearPOBatch(p) {
+  const rows = await readRange(S.PO, "A1:ZZ2000", "FORMATTED_VALUE");
+  const headers = rows[0].map(h => String(h).trim());
+  const ci = {}; headers.forEach((h, i) => { ci[h] = i; });
+  let cleared = 0;
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if ((r[ci["Vendor"]] || "Unassigned") === p.vendor && (r[ci["Batch ID"]] || "Legacy") === p.batchId && r[ci["Status"]] === "Generated") {
+      await writeCell(S.PO, i + 1, ci["Status"] + 1, "Cleared"); cleared++;
+    }
+  }
+  invalidate("po", "po_batches");
+  return { cleared };
+}
+
+// =================== MANUAL PURCHASE HANDLERS ===================
+async function handleAddManualPurchase(p) {
+  const products = await cached("products", readProducts);
+  const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(p.itemName || p.newName));
+  if (!item) throw new Error("Item not found");
+  const qty = Number(p.qty) || 0; if (qty <= 0) throw new Error("Invalid quantity");
+  const newPurchase = round3(num(item["Purchase Stock  QTy"]) + qty);
+  await writeCell(S.PRODUCTS, item._row, 11, newPurchase);
+  if (p.rate) await writeCell(S.PRODUCTS, item._row, 17, Number(p.rate));
+  if (p.expiryDate) await writeCell(S.PRODUCTS, item._row, 19, p.expiryDate);
+  await appendRow(S.PO, ["MPO-" + Date.now(), new Date().toISOString(), item["Item Name (Standardized)"], p.category || item.Category || "", p.unit || item.Unit || "", qty, "Received (Manual)", p.enteredBy || "", "Manual purchase entry"]);
+  invalidate("products", "po", "dash", "mpo");
+  return { itemName: item["Item Name (Standardized)"], newValue: round3(num(item["Current Stock"]) + qty) };
+}
+async function handleEditManualPurchase(p) {
+  const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
+  await writeCell(S.PO, row, 6, Number(p.newQty) || 0);
+  invalidate("po", "mpo", "products", "dash");
+  return { row };
+}
+async function handleDeleteManualPurchase(p) {
+  const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
+  await writeCell(S.PO, row, 7, "Cancelled");
+  invalidate("po", "mpo", "products", "dash");
+  return { row };
+}
+
+// =================== STAFF HANDLERS ===================
+async function handleAddStaff(p) {
+  const staff = await cached("staff", readStaff);
+  const userId = p.userId || (String(p.name).replace(/\s+/g, "") + "-" + String(staff.length + 1).padStart(3, "0"));
+  await appendRow(S.STAFF, [p.name, p.designation, p.shift, userId, p.permission, p.password || "123"]);
+  invalidate("staff", "dash");
+  return { userId };
+}
+async function handleUpdateStaff(p) {
+  const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
+  await writeCell(S.STAFF, row, 1, p.name);
+  await writeCell(S.STAFF, row, 2, p.designation);
+  await writeCell(S.STAFF, row, 3, p.shift);
+  await writeCell(S.STAFF, row, 4, p.userId);
+  await writeCell(S.STAFF, row, 5, p.permission);
+  await writeCell(S.STAFF, row, 6, p.password);
+  invalidate("staff", "dash");
+  return { row };
+}
+async function handleDeleteStaff(p) {
+  const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
+  const sh = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
+  const sheetId = sh.data.sheets.find(s => s.properties.title === S.STAFF)?.properties.sheetId;
+  if (sheetId !== undefined) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: { requests: [{ deleteDimension: { range: { sheetId, dimension: "ROWS", startIndex: row - 1, endIndex: row } } }] },
+    });
+  }
+  invalidate("staff", "dash");
+  return { deleted: row };
+}
+
+// =================== PRODUCT HANDLERS ===================
+async function handleAddProduct(p) {
+  const products = await cached("products", readProducts);
+  if (products.find(x => normH(x["Item Name (Standardized)"]) === normH(p.name))) throw new Error("Item already exists");
+  const suq = Number(p.stockUnitQty) || 1;
+  await appendRow(S.PRODUCTS, [products.length + 1, p.name, p.category || "", p.packaging || "", p.unit || "", 0, 0, 0, p.demandUnit || p.unit || "", 0, 0, "", "", Number(p.minStock) || 0, Number(p.maxStock) || 0, "", "", p.unit || "", "", p.baseUnit || p.unit || "", suq, p.stockType || "Stocked"]);
+  invalidate("products", "dash");
+  return { added: p.name };
+}
+async function handleAddVendor(p) {
+  const name = String(p.name || "").trim(); if (!name) throw new Error("Vendor name khali hai");
+  const extra = await getSetting("ExtraVendors", "");
+  let list = []; if (extra) { try { list = JSON.parse(extra); } catch (e) {} }
+  if (!list.some(v => String(v).toLowerCase() === name.toLowerCase())) { list.push(name); await setSetting("ExtraVendors", JSON.stringify(list)); }
+  invalidate("vendors");
+  return { name, added: true };
+}
+async function handleSetProductVendor(p) {
+  const products = await cached("products", readProducts);
+  const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(p.itemName));
+  if (!item) throw new Error("Item not found");
+  await writeCell(S.PRODUCTS, item._row, 16, p.vendor || "");
+  invalidate("products");
+  return { itemName: p.itemName, vendor: p.vendor };
+}
+
+// =================== PO BATCHES ===================
 async function readPOBatches() {
   const pos = (await cached("po", readPO)).filter(po => po.Status !== "Cancelled");
   const batches = {};
@@ -477,6 +729,82 @@ async function readPOBatches() {
   const order = { Pending: 0, Generated: 1, Cleared: 2 };
   return list.sort((a, b) => (order[a.status] - order[b.status]));
 }
+
+// =================== ROUTER ===================
+app.all("/", async (req, res) => {
+  const payload = { ...req.query, ...req.body };
+  const action = payload.action;
+  if (!action) return res.json({ ok: true, service: "Peetambra Bridge Running" });
+  try {
+    let data;
+    if (action === "login") data = await handleLogin(payload);
+    else if (action === "bootstrap") data = await handleBootstrap(payload);
+    else if (action === "poll") data = await buildPoll();
+    else if (action === "getProducts") data = await cached("products", readProducts);
+    else if (action === "getCategories") data = [...new Set((await cached("products", readProducts)).map(p => p.Category).filter(Boolean))].sort();
+    else if (action === "getStaff") data = await cached("staff", readStaff);
+    else if (action === "getVendors") data = await cached("vendors", readVendors);
+    else if (action === "getDemands") data = await cached("demands", readDemands);
+    else if (action === "getDashboardStats") data = await buildDashboardStats();
+    else if (action === "getLowStockAlerts") {
+      const products = await cached("products", readProducts);
+      data = products.filter(p => { const min = num(p.Min), max = num(p.Max), cur = num(p["Current Stock In Carton"]); return (min > 0 && cur <= min) || (max > 0 && cur >= max); })
+        .map(p => ({ "Item Name": p["Item Name (Standardized)"], Category: p.Category, Unit: p.Unit, "Current Stock": p["Current Stock"], "Min Stock": p.Min, "Max Stock": p.Max, "Status": (num(p.Min) > 0 && num(p["Current Stock In Carton"]) <= num(p.Min)) ? "LOW" : "OVERSTOCK" }));
+    }
+    else if (action === "getWarehouseEntries") data = await cached("whlog", readWarehouseEntries);
+    else if (action === "getCylinderEntries") data = await cached("cyl", readCylinderEntries);
+    else if (action === "getCylinderPrice") data = Number(await getSetting("CylinderPrice", "2900")) || 2900;
+    else if (action === "getPOBatches") data = await cached("po_batches", readPOBatches);
+    else if (action === "getPurchaseOrders") data = await cached("po", readPO);
+    else if (action === "getManualPurchases") data = await cached("mpo", readManualPurchases);
+    else if (action === "getAttendance") {
+      let att = await cached("attendance", readAttendance);
+      if (payload.userId) att = att.filter(r => String(r["User ID"]).toLowerCase().trim() === String(payload.userId).toLowerCase().trim());
+      data = att;
+    }
+    else if (action === "addProduct") data = await handleAddProduct(payload);
+    else if (action === "addWarehouseEntry") data = await handleAddWarehouseEntry(payload);
+    else if (action === "editWarehouseEntry") data = await handleEditWarehouseEntry(payload);
+    else if (action === "deleteWarehouseEntry") data = await handleDeleteWarehouseEntry(payload);
+    else if (action === "addDemand") data = await handleAddDemand(payload);
+    else if (action === "approveDemands") data = await handleApproveDemands(payload);
+    else if (action === "approveDemand") data = await handleApproveDemands({ items: [{ row: payload.row, approvedQty: payload.approvedQty, feedback: payload.feedback }] });
+    else if (action === "rejectDemands") data = await handleRejectDemands(payload);
+    else if (action === "rejectDemand") data = await handleRejectDemands({ rows: [payload.row] });
+    else if (action === "editDemand") data = await handleEditDemand(payload);
+    else if (action === "deleteDemand") data = await handleDeleteDemand(payload);
+    else if (action === "saveDemandFeedback") data = await handleSaveDemandFeedback(payload);
+    else if (action === "addPurchaseOrder") data = await handleAddPurchaseOrder(payload);
+    else if (action === "cancelPO") data = await handleCancelPO(payload);
+    else if (action === "clearPOBatch") data = await handleClearPOBatch(payload);
+    else if (action === "addManualPurchase") data = await handleAddManualPurchase(payload);
+    else if (action === "editManualPurchase") data = await handleEditManualPurchase(payload);
+    else if (action === "deleteManualPurchase") data = await handleDeleteManualPurchase(payload);
+    else if (action === "addVendor") data = await handleAddVendor(payload);
+    else if (action === "setProductVendor") data = await handleSetProductVendor(payload);
+    else if (action === "markAttendance") data = await handleMarkAttendance(payload);
+    else if (action === "editAttendancePunch") data = await handleEditAttendancePunch(payload);
+    else if (action === "addCylinderEntry") data = await handleAddCylinderEntry(payload);
+    else if (action === "updateCylinderPrice") { const price = Number(payload.price) || 0; if (price <= 0) throw new Error("Invalid price"); await setSetting("CylinderPrice", price); invalidate("cyl"); data = { price }; }
+    else if (action === "addStaff") data = await handleAddStaff(payload);
+    else if (action === "updateStaff") data = await handleUpdateStaff(payload);
+    else if (action === "deleteStaff") data = await handleDeleteStaff(payload);
+    else if (action === "uploadPhoto") {
+      let url = "";
+      try {
+        const r = await fetch(APPS_SCRIPT_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "uploadPhoto", photoBase64: payload.photoBase64, userId: payload.userId || "photo", name: payload.name || "photo" }) });
+        const j = await r.json();
+        url = (j && (j.url || (j.data && j.data.url))) || "";
+      } catch (e) {}
+      data = { url };
+    }
+    else data = { note: "Action not implemented yet: " + action };
+    res.json({ ok: true, data });
+  } catch (e) {
+    console.error("Router error on action", action, ":", e.message);
+    res.json({ ok: false, error: e.message });
+  }
+});
 
 app.get("/", (req, res) => res.json({ ok: true, service: "Peetambra Bridge Running" }));
 
