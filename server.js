@@ -369,6 +369,7 @@ async function handleApproveDemands(p) {
   return { results };
 }
 
+// 🔧 UPDATED: reject now subtracts qty from Product Master column H
 async function handleRejectDemands(p) {
   const rows = Array.isArray(p.rows) ? p.rows.map(Number) : [];
   if (!rows.length) throw new Error("Koi demand select nahi hui.");
@@ -376,27 +377,96 @@ async function handleRejectDemands(p) {
   for (const row of rows) {
     try {
       if (!row || row < 2) throw new Error("Invalid row");
+
+      // 1. Demand row padho
+      const demRows = await readRange(S.DEMAND, `A${row}:N${row}`, "FORMATTED_VALUE");
+      const r = demRows[0] || [];
+      const status = r[7] || "Pending";
+      if (status !== "Pending") throw new Error("Ye demand pehle hi " + status + " ho chuki hai.");
+      const itemName = String(r[3] || "").trim();
+      const qty = num(r[6]);
+
+      // 2. Product Master se qty minus karo
+      if (itemName && qty > 0) {
+        const products = await cached("products", readProducts);
+        const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(itemName));
+        if (item && item._row) {
+          const currentDemand = num(item["Deman for canteen"]);
+          const newDemand = Math.max(0, round3(currentDemand - qty));
+          await writeCell(S.PRODUCTS, item._row, 8, newDemand);
+        }
+      }
+
+      // 3. Demand ko Rejected mark karo
       await writeCell(S.DEMAND, row, 8, "Rejected");
-      results.push({ row, ok: true });
+      results.push({ row, ok: true, subtracted: qty });
     } catch (e) { results.push({ row, ok: false, error: e.message }); }
   }
   invalidate("demands", "products", "dash");
   return { results };
 }
 
+// 🔧 UPDATED: edit now adjusts Product Master column H by diff
 async function handleEditDemand(p) {
-  const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
-  const newQty = Number(p.newQty); if (isNaN(newQty) || newQty <= 0) throw new Error("Invalid quantity");
+  const row = Number(p.row);
+  if (!row || row < 2) throw new Error("Invalid row");
+  const newQty = Number(p.newQty);
+  if (isNaN(newQty) || newQty <= 0) throw new Error("Invalid quantity");
+
+  // 1. Demand row padho
+  const demRows = await readRange(S.DEMAND, `A${row}:N${row}`, "FORMATTED_VALUE");
+  const r = demRows[0] || [];
+  const status = r[7] || "Pending";
+  if (status !== "Pending") throw new Error("Ye demand pehle hi " + status + " ho chuki hai.");
+  const itemName = String(r[3] || "").trim();
+  const oldQty = num(r[6]);
+  const diff = round3(newQty - oldQty);
+
+  // 2. Product Master mein difference adjust karo (agar edit badi hui to +, choti hui to -)
+  if (itemName && diff !== 0) {
+    const products = await cached("products", readProducts);
+    const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(itemName));
+    if (item && item._row) {
+      const currentDemand = num(item["Deman for canteen"]);
+      const newDemand = Math.max(0, round3(currentDemand + diff));
+      await writeCell(S.PRODUCTS, item._row, 8, newDemand);
+    }
+  }
+
+  // 3. Demand row mein qty update karo
   await writeCell(S.DEMAND, row, 7, newQty);
-  invalidate("demands");
-  return { row };
+  invalidate("demands", "products", "dash");
+  return { row, oldQty, newQty, diff };
 }
 
+// 🔧 UPDATED: delete now subtracts qty from Product Master column H
 async function handleDeleteDemand(p) {
-  const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
+  const row = Number(p.row);
+  if (!row || row < 2) throw new Error("Invalid row");
+
+  // 1. Pehle demand row padho — item name + qty nikaalo
+  const demRows = await readRange(S.DEMAND, `A${row}:N${row}`, "FORMATTED_VALUE");
+  const r = demRows[0] || [];
+  const status = r[7] || "Pending";
+  if (status !== "Pending") throw new Error("Ye demand pehle hi " + status + " ho chuki hai.");
+  const itemName = String(r[3] || "").trim();
+  const qty = num(r[6]);
+
+  // 2. Product Master mein "Deman for canteen" (column H = 8) se qty minus karo
+  if (itemName && qty > 0) {
+    const products = await cached("products", readProducts);
+    const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(itemName));
+    if (item && item._row) {
+      const currentDemand = num(item["Deman for canteen"]);
+      const newDemand = Math.max(0, round3(currentDemand - qty));
+      await writeCell(S.PRODUCTS, item._row, 8, newDemand);
+    }
+  }
+
+  // 3. Demand ko Cancelled mark karo
   await writeCell(S.DEMAND, row, 8, "Cancelled");
   invalidate("demands", "products", "dash");
-  return { row };
+  return { row, subtracted: qty };
 }
 
 async function handleSaveDemandFeedback(p) {
