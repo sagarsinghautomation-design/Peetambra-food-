@@ -5,6 +5,8 @@ const cors = require("cors");
 
 const app = express();
 app.use(cors());
+// 👇 YEH LINE ZAROORI HAI - Form data aur URL-encoded data ke liye
+app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ limit: "20mb" }));
 
 const cache = new NodeCache({ stdTTL: 120, checkperiod: 30 });
@@ -117,11 +119,13 @@ async function handleAddDemand(p) {
   return { id };
 }
 
-// =================== ROUTER ===================
-app.post("/", async (req, res) => {
-  const payload = req.body;
+// =================== ROUTER (Updated to handle GET & POST both) ===================
+// 👇 YEH ROUTER ZAROORI HAI - Yeh GET aur POST dono ko handle karega
+app.all("/", async (req, res) => {
+  const payload = { ...req.query, ...req.body };
   const action = payload.action;
-  if (!action) return res.json({ ok: false, error: "Missing action" });
+
+  if (!action) return res.json({ ok: true, service: "Peetambra Bridge Running" });
 
   try {
     let data;
@@ -143,8 +147,6 @@ app.post("/", async (req, res) => {
     res.json({ ok: false, error: e.message });
   }
 });
-
-app.get("/", (req, res) => res.json({ ok: true, service: "Peetambra Bridge Running" }));
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("🚀 Bridge running on port " + PORT));
