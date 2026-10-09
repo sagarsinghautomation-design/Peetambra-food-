@@ -5,9 +5,14 @@ const cors = require("cors");
 
 const app = express();
 app.use(cors());
-// 👇 YEH LINE ZAROORI HAI - Form data aur URL-encoded data ke liye
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ limit: "20mb" }));
+
+// 👇 Yeh logger har request ko Render logs mein dikhayega
+app.use((req, res, next) => {
+  console.log("Incoming Request:", req.method, req.url, "Action:", req.body.action || req.query.action);
+  next();
+});
 
 const cache = new NodeCache({ stdTTL: 120, checkperiod: 30 });
 
@@ -18,11 +23,16 @@ const auth = new google.auth.GoogleAuth({
 const sheets = google.sheets({ version: "v4", auth });
 const SHEET_ID = process.env.SHEET_ID;
 
+// 👇 Yahan Typo Fix kiya gaya hai (Attendance Master)
 const S = {
-  PRODUCTS: "Product & Stock Master", ATTENDANCE: "Attendence Master",
-  DEMAND: "Demand For Canteen", PO: "Purchase Orders",
-  STAFF: "Staff & Permissions", WHLOG: "Warehouse Entry Log",
-  CYLINDER: "Cylinder Entry", SETTINGS: "Settings",
+  PRODUCTS: "Product & Stock Master", 
+  ATTENDANCE: "Attendance Master", 
+  DEMAND: "Demand For Canteen", 
+  PO: "Purchase Orders",
+  STAFF: "Staff & Permissions", 
+  WHLOG: "Warehouse Entry Log",
+  CYLINDER: "Cylinder Entry", 
+  SETTINGS: "Settings",
 };
 
 function num(v) { const n = Number(v); return isNaN(n) ? 0 : n; }
@@ -93,7 +103,6 @@ async function handleLogin(p) {
     shift: match["Shift Timing"], permission: match.Permission
   };
 
-  // 👇 Yeh hissa bootstrap data add karega (bilkul purane Apps Script jaisa)
   try {
     const want = [];
     const perm = result.permission;
@@ -108,6 +117,7 @@ async function handleLogin(p) {
     result.bootstrap = await handleBootstrap({ want: want, userId: result.userId });
   } catch (e) {
     console.error("Bootstrap error:", e);
+    result.bootstrapError = e.message; // Frontend ko batao ki error kya hai
   }
 
   return result;
@@ -115,14 +125,16 @@ async function handleLogin(p) {
 
 async function handleBootstrap(p) {
   const want = p.want || []; const out = {}; const tasks = [];
-  if (want.includes("products")) tasks.push(cached("products", readProducts).then(d => out.products = d));
-  if (want.includes("demands")) tasks.push(cached("demands", readDemands).then(d => out.demands = d));
-  if (want.includes("staff")) tasks.push(cached("staff", readStaff).then(d => out.staff = d));
+  
+  // Har ek sheet ko alag se catch karo taaki ek error se poora login na ruke
+  if (want.includes("products")) tasks.push(cached("products", readProducts).then(d => out.products = d).catch(e => out.productsError = e.message));
+  if (want.includes("demands")) tasks.push(cached("demands", readDemands).then(d => out.demands = d).catch(e => out.demandsError = e.message));
+  if (want.includes("staff")) tasks.push(cached("staff", readStaff).then(d => out.staff = d).catch(e => out.staffError = e.message));
   if (want.includes("myAttendance") || want.includes("allAttendance")) {
     tasks.push(cached("attendance", async () => rowsToObjects(await readRange(S.ATTENDANCE))).then(d => {
       if (want.includes("myAttendance")) out.myAttendance = d.filter(r => String(r["User ID"]) === String(p.userId));
       if (want.includes("allAttendance")) out.allAttendance = d;
-    }));
+    }).catch(e => out.attendanceError = e.message));
   }
   await Promise.all(tasks);
   return out;
@@ -142,8 +154,7 @@ async function handleAddDemand(p) {
   return { id };
 }
 
-// =================== ROUTER (Updated to handle GET & POST both) ===================
-// 👇 YEH ROUTER ZAROORI HAI - Yeh GET aur POST dono ko handle karega
+// =================== ROUTER ===================
 app.all("/", async (req, res) => {
   const payload = { ...req.query, ...req.body };
   const action = payload.action;
@@ -167,6 +178,7 @@ app.all("/", async (req, res) => {
 
     res.json({ ok: true, data });
   } catch (e) {
+    console.error("Router error:", e);
     res.json({ ok: false, error: e.message });
   }
 });
