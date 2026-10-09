@@ -87,7 +87,30 @@ async function handleLogin(p) {
   const staff = await cached("staff", readStaff);
   const match = staff.find(r => String(r.User || "").toLowerCase().trim() === String(p.userId).toLowerCase().trim() && String(r.Password || "").trim() === String(p.password).trim());
   if (!match) throw new Error("Invalid User ID or Password");
-  return { userId: match.User, name: match.Name, designation: match.Designation, shift: match["Shift Timing"], permission: match.Permission };
+
+  const result = {
+    userId: match.User, name: match.Name, designation: match.Designation,
+    shift: match["Shift Timing"], permission: match.Permission
+  };
+
+  // 👇 Yeh hissa bootstrap data add karega (bilkul purane Apps Script jaisa)
+  try {
+    const want = [];
+    const perm = result.permission;
+    if (perm === "SuperAdmin") {
+      want.push("staff", "allAttendance");
+    } else {
+      want.push("myAttendance");
+      if (perm === "Admin") want.push("stats", "products", "demands");
+      else if (perm === "Supervisor") want.push("demands", "products", "vendors");
+      else if (perm === "Cashier") want.push("products", "demands");
+    }
+    result.bootstrap = await handleBootstrap({ want: want, userId: result.userId });
+  } catch (e) {
+    console.error("Bootstrap error:", e);
+  }
+
+  return result;
 }
 
 async function handleBootstrap(p) {
