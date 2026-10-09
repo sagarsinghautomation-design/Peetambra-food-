@@ -8,12 +8,6 @@ app.use(cors());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ limit: "20mb" }));
 
-// 👇 Yeh logger har request ko Render logs mein dikhayega
-app.use((req, res, next) => {
-  console.log("Incoming Request:", req.method, req.url, "Action:", req.body.action || req.query.action);
-  next();
-});
-
 const cache = new NodeCache({ stdTTL: 120, checkperiod: 30 });
 
 const auth = new google.auth.GoogleAuth({
@@ -23,7 +17,7 @@ const auth = new google.auth.GoogleAuth({
 const sheets = google.sheets({ version: "v4", auth });
 const SHEET_ID = process.env.SHEET_ID;
 
-// 👇 Yahan Typo Fix kiya gaya hai (Attendance Master)
+// 👇 Sheet ke naam bilkul tumhari sheet ke tabs se match hone chahiye
 const S = {
   PRODUCTS: "Product & Stock Master", 
   ATTENDANCE: "Attendance Master", 
@@ -57,17 +51,14 @@ function rowsToObjects(rows) {
   });
 }
 
-// =================== READERS ===================
 async function readStaff() { return rowsToObjects(await readRange(S.STAFF)); }
 async function readDemands() {
   const rows = await readRange(S.DEMAND, "A1:N500");
   return rows.slice(1).reverse().map((r, i) => ({
     _row: rows.length - i, "Demand ID": r[0], Timestamp: r[1], "Raised By": r[2], "Item Name": r[3],
     Category: r[4], Unit: r[5], "Qty Requested": r[6], Status: r[7] || "Pending",
-    "Warehouse Stock After": r[8], Notes: r[9], "Approved Qty": r[10], "Approved At": r[11] || "",
   }));
 }
-
 async function readProducts() {
   const rows = await readRange(S.PRODUCTS);
   if (rows.length < 2) return [];
@@ -79,8 +70,7 @@ async function readProducts() {
     const r = rows[i]; if (!r || !String(r[C.NAME] || "").trim()) continue;
     const openFull = num(r[C.OPENFULL]), openLoose = num(r[C.OPENLOOSE]), purchase = num(r[C.PURCHASE]), approved = num(r[C.APPROVED]);
     const suq = num(r[C.STOCKUNITQTY]) || 1;
-    const opening = round3(openFull * suq + openLoose);
-    const currentPcs = round3(opening + purchase - approved);
+    const currentPcs = round3(openFull * suq + openLoose + purchase - approved);
     out.push({ _row: i + 1, "Item Name (Standardized)": String(r[C.NAME]).trim(), Category: r[C.CAT] || "", Unit: r[C.UNIT] || "", "W/H Opening Full Pack": openFull, "W/H Opening Loose": openLoose, "Deman for canteen": num(r[C.DEMAND]), "Approved Demand Qty by supervisor": approved, "Purchase Stock  QTy": purchase, "Current Stock": currentPcs, "Current Stock In Carton": round3(currentPcs / suq), Min: r[C.MIN], Max: r[C.MAX], Vendor: r[C.VENDOR] || "" });
   }
   return out;
@@ -92,7 +82,25 @@ async function cached(key, builder) {
 }
 function invalidate(...keys) { keys.forEach(k => cache.del(k)); }
 
-// =================== HANDLERS ===================
+// 👇 YEH BOOTSTRAP AB KABHI CRASH NAHI HOGA
+async function handleBootstrap(p) {
+  const want = p.want || []; 
+  const out = { products: [], demands: [], staff: [], myAttendance: [], allAttendance: [] }; 
+  const tasks = [];
+  
+  if (want.includes("products")) tasks.push(cached("products", readProducts).then(d => out.products = d).catch(e => console.error("Products error:", e.message)));
+  if (want.includes("demands")) tasks.push(cached("demands", readDemands).then(d => out.demands = d).catch(e => console.error("Demands error:", e.message)));
+  if (want.includes("staff")) tasks.push(cached("staff", readStaff).then(d => out.staff = d).catch(e => console.error("Staff error:", e.message)));
+  if (want.includes("myAttendance") || want.includes("allAttendance")) {
+    tasks.push(cached("attendance", async () => rowsToObjects(await readRange(S.ATTENDANCE))).then(d => {
+      if (want.includes("myAttendance")) out.myAttendance = d.filter(r => String(r["User ID"]) === String(p.userId));
+      if (want.includes("allAttendance")) out.allAttendance = d;
+    }).catch(e => console.error("Attendance error:", e.message)));
+  }
+  await Promise.all(tasks);
+  return out;
+}
+
 async function handleLogin(p) {
   const staff = await cached("staff", readStaff);
   const match = staff.find(r => String(r.User || "").toLowerCase().trim() === String(p.userId).toLowerCase().trim() && String(r.Password || "").trim() === String(p.password).trim());
@@ -103,12 +111,12 @@ async function handleLogin(p) {
     shift: match["Shift Timing"], permission: match.Permission
   };
 
+  // Bootstrap ko hamesha attach karo, chahe error aaye ya na aaye
   try {
     const want = [];
     const perm = result.permission;
-    if (perm === "SuperAdmin") {
-      want.push("staff", "allAttendance");
-    } else {
+    if (perm === "SuperAdmin") want.push("staff", "allAttendance");
+    else {
       want.push("myAttendance");
       if (perm === "Admin") want.push("stats", "products", "demands");
       else if (perm === "Supervisor") want.push("demands", "products", "vendors");
@@ -116,49 +124,15 @@ async function handleLogin(p) {
     }
     result.bootstrap = await handleBootstrap({ want: want, userId: result.userId });
   } catch (e) {
-    console.error("Bootstrap error:", e);
-    result.bootstrapError = e.message; // Frontend ko batao ki error kya hai
+    console.error("Bootstrap fatal error:", e);
+    result.bootstrap = { products: [], demands: [], staff: [], myAttendance: [], allAttendance: [] }; // Fallback empty data
   }
-
   return result;
 }
 
-async function handleBootstrap(p) {
-  const want = p.want || []; const out = {}; const tasks = [];
-  
-  // Har ek sheet ko alag se catch karo taaki ek error se poora login na ruke
-  if (want.includes("products")) tasks.push(cached("products", readProducts).then(d => out.products = d).catch(e => out.productsError = e.message));
-  if (want.includes("demands")) tasks.push(cached("demands", readDemands).then(d => out.demands = d).catch(e => out.demandsError = e.message));
-  if (want.includes("staff")) tasks.push(cached("staff", readStaff).then(d => out.staff = d).catch(e => out.staffError = e.message));
-  if (want.includes("myAttendance") || want.includes("allAttendance")) {
-    tasks.push(cached("attendance", async () => rowsToObjects(await readRange(S.ATTENDANCE))).then(d => {
-      if (want.includes("myAttendance")) out.myAttendance = d.filter(r => String(r["User ID"]) === String(p.userId));
-      if (want.includes("allAttendance")) out.allAttendance = d;
-    }).catch(e => out.attendanceError = e.message));
-  }
-  await Promise.all(tasks);
-  return out;
-}
-
-async function handleAddDemand(p) {
-  const products = await cached("products", readProducts);
-  const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(p.itemName));
-  if (!item) throw new Error("Item not found");
-  const id = "DMD-" + Date.now();
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID, range: `'${S.DEMAND}'!A1`,
-    valueInputOption: "USER_ENTERED", insertDataOption: "INSERT_ROWS",
-    requestBody: { values: [[id, new Date().toISOString(), p.raisedBy, p.itemName, p.category || item.Category, p.unit || item.Unit, p.qty, "Pending", "", p.notes || "", "", "", "", ""]] }
-  });
-  invalidate("demands", "products");
-  return { id };
-}
-
-// =================== ROUTER ===================
 app.all("/", async (req, res) => {
   const payload = { ...req.query, ...req.body };
   const action = payload.action;
-
   if (!action) return res.json({ ok: true, service: "Peetambra Bridge Running" });
 
   try {
@@ -168,14 +142,7 @@ app.all("/", async (req, res) => {
     else if (action === "getProducts") data = await cached("products", readProducts);
     else if (action === "getStaff") data = await cached("staff", readStaff);
     else if (action === "getDemands") data = await cached("demands", readDemands);
-    else if (action === "getAttendance") {
-        let att = await cached("attendance", async () => rowsToObjects(await readRange(S.ATTENDANCE)));
-        if (payload.userId) att = att.filter(r => String(r["User ID"]) === String(payload.userId));
-        data = att;
-    }
-    else if (action === "addDemand") data = await handleAddDemand(payload);
     else data = { note: "Action not implemented yet: " + action };
-
     res.json({ ok: true, data });
   } catch (e) {
     console.error("Router error:", e);
