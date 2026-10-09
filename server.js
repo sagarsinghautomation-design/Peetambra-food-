@@ -20,10 +20,10 @@ const SHEET_ID = process.env.SHEET_ID;
 // 👇 Sheet ke naam bilkul tumhari sheet ke tabs se match hone chahiye
 const S = {
   PRODUCTS: "Product & Stock Master", 
-  ATTENDANCE: "Attendance Master", 
-  DEMAND: "Demand For Canteen", 
+  ATTENDANCE: "Attendance",       // 👈 'Attendance Master' se badal kar 'Attendance' kiya
+  DEMAND: "Demand",               // 👈 'Demand For Canteen' se badal kar 'Demand' kiya
   PO: "Purchase Orders",
-  STAFF: "Staff & Permissions", 
+  STAFF: "Staff",                 // 👈 'Staff & Permissions' se badal kar 'Staff' kiya
   WHLOG: "Warehouse Entry Log",
   CYLINDER: "Cylinder Entry", 
   SETTINGS: "Settings",
