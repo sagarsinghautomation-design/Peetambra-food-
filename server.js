@@ -7,31 +7,20 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
 
-// 2 minute ka RAM cache (isse speed 10x ho jayegi)
 const cache = new NodeCache({ stdTTL: 120, checkperiod: 30 });
 
-// Google Auth Setup
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT),
-  scopes: [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-  ],
+  scopes: ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
 });
 const sheets = google.sheets({ version: "v4", auth });
-
 const SHEET_ID = process.env.SHEET_ID;
-const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
 
 const S = {
-  PRODUCTS: "Product & Stock Master",
-  ATTENDANCE: "Attendence Master",
-  DEMAND: "Demand For Canteen",
-  PO: "Purchase Orders",
-  STAFF: "Staff & Permissions",
-  WHLOG: "Warehouse Entry Log",
-  CYLINDER: "Cylinder Entry",
-  SETTINGS: "Settings",
+  PRODUCTS: "Product & Stock Master", ATTENDANCE: "Attendence Master",
+  DEMAND: "Demand For Canteen", PO: "Purchase Orders",
+  STAFF: "Staff & Permissions", WHLOG: "Warehouse Entry Log",
+  CYLINDER: "Cylinder Entry", SETTINGS: "Settings",
 };
 
 function num(v) { const n = Number(v); return isNaN(n) ? 0 : n; }
@@ -40,8 +29,7 @@ function normH(s) { return String(s).toLowerCase().replace(/\s+/g, " ").trim(); 
 
 async function readRange(sheetName, range = "A1:ZZ5000") {
   const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `'${sheetName}'!${range}`,
+    spreadsheetId: SHEET_ID, range: `'${sheetName}'!${range}`,
     valueRenderOption: "UNFORMATTED_VALUE",
   });
   return res.data.values || [];
@@ -57,9 +45,9 @@ function rowsToObjects(rows) {
   });
 }
 
-// =================== READERS (Cached) ===================
+// =================== READERS ===================
 async function readStaff() { return rowsToObjects(await readRange(S.STAFF)); }
-async function readDemands() { 
+async function readDemands() {
   const rows = await readRange(S.DEMAND, "A1:N500");
   return rows.slice(1).reverse().map((r, i) => ({
     _row: rows.length - i, "Demand ID": r[0], Timestamp: r[1], "Raised By": r[2], "Item Name": r[3],
@@ -87,44 +75,76 @@ async function readProducts() {
 }
 
 async function cached(key, builder) {
-  const hit = cache.get(key);
-  if (hit) return hit;
-  const data = await builder();
-  cache.set(key, data);
-  return data;
+  const hit = cache.get(key); if (hit) return hit;
+  const data = await builder(); cache.set(key, data); return data;
 }
 function invalidate(...keys) { keys.forEach(k => cache.del(k)); }
 
-// =================== ROUTES ===================
+// =================== HANDLERS ===================
+async function handleLogin(p) {
+  const staff = await cached("staff", readStaff);
+  const match = staff.find(r => String(r.User || "").toLowerCase().trim() === String(p.userId).toLowerCase().trim() && String(r.Password || "").trim() === String(p.password).trim());
+  if (!match) throw new Error("Invalid User ID or Password");
+  return { userId: match.User, name: match.Name, designation: match.Designation, shift: match["Shift Timing"], permission: match.Permission };
+}
+
+async function handleBootstrap(p) {
+  const want = p.want || []; const out = {}; const tasks = [];
+  if (want.includes("products")) tasks.push(cached("products", readProducts).then(d => out.products = d));
+  if (want.includes("demands")) tasks.push(cached("demands", readDemands).then(d => out.demands = d));
+  if (want.includes("staff")) tasks.push(cached("staff", readStaff).then(d => out.staff = d));
+  if (want.includes("myAttendance") || want.includes("allAttendance")) {
+    tasks.push(cached("attendance", async () => rowsToObjects(await readRange(S.ATTENDANCE))).then(d => {
+      if (want.includes("myAttendance")) out.myAttendance = d.filter(r => String(r["User ID"]) === String(p.userId));
+      if (want.includes("allAttendance")) out.allAttendance = d;
+    }));
+  }
+  await Promise.all(tasks);
+  return out;
+}
+
+async function handleAddDemand(p) {
+  const products = await cached("products", readProducts);
+  const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(p.itemName));
+  if (!item) throw new Error("Item not found");
+  const id = "DMD-" + Date.now();
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID, range: `'${S.DEMAND}'!A1`,
+    valueInputOption: "USER_ENTERED", insertDataOption: "INSERT_ROWS",
+    requestBody: { values: [[id, new Date().toISOString(), p.raisedBy, p.itemName, p.category || item.Category, p.unit || item.Unit, p.qty, "Pending", "", p.notes || "", "", "", "", ""]] }
+  });
+  invalidate("demands", "products");
+  return { id };
+}
+
+// =================== ROUTER ===================
+app.post("/", async (req, res) => {
+  const payload = req.body;
+  const action = payload.action;
+  if (!action) return res.json({ ok: false, error: "Missing action" });
+
+  try {
+    let data;
+    if (action === "login") data = await handleLogin(payload);
+    else if (action === "bootstrap") data = await handleBootstrap(payload);
+    else if (action === "getProducts") data = await cached("products", readProducts);
+    else if (action === "getStaff") data = await cached("staff", readStaff);
+    else if (action === "getDemands") data = await cached("demands", readDemands);
+    else if (action === "getAttendance") {
+        let att = await cached("attendance", async () => rowsToObjects(await readRange(S.ATTENDANCE)));
+        if (payload.userId) att = att.filter(r => String(r["User ID"]) === String(payload.userId));
+        data = att;
+    }
+    else if (action === "addDemand") data = await handleAddDemand(payload);
+    else data = { note: "Action not implemented yet: " + action };
+
+    res.json({ ok: true, data });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
 app.get("/", (req, res) => res.json({ ok: true, service: "Peetambra Bridge Running" }));
-
-app.post("/login", async (req, res) => {
-  try {
-    const { userId, password } = req.body;
-    const staff = await cached("staff", readStaff);
-    const match = staff.find(r => String(r.User || "").toLowerCase().trim() === String(userId).toLowerCase().trim() && String(r.Password || "").trim() === String(password).trim());
-    if (!match) return res.json({ ok: false, error: "Invalid User ID or Password" });
-    res.json({ ok: true, data: { userId: match.User, name: match.Name, designation: match.Designation, shift: match["Shift Timing"], permission: match.Permission } });
-  } catch (e) { res.json({ ok: false, error: e.message }); }
-});
-
-app.post("/bootstrap", async (req, res) => {
-  try {
-    const { want = [], userId } = req.body;
-    const out = {};
-    const tasks = [];
-    if (want.includes("products")) tasks.push(cached("products", readProducts).then(d => out.products = d));
-    if (want.includes("demands")) tasks.push(cached("demands", readDemands).then(d => out.demands = d));
-    if (want.includes("staff")) tasks.push(cached("staff", readStaff).then(d => out.staff = d));
-    if (want.includes("myAttendance")) tasks.push(cached("attendance", async () => rowsToObjects(await readRange(S.ATTENDANCE))).then(d => out.myAttendance = d.filter(r => String(r["User ID"]) === String(userId))));
-    await Promise.all(tasks);
-    res.json({ ok: true, data: out });
-  } catch (e) { res.json({ ok: false, error: e.message }); }
-});
-
-app.get("/products", async (req, res) => { res.json({ ok: true, data: await cached("products", readProducts) }); });
-app.get("/demands", async (req, res) => { res.json({ ok: true, data: await cached("demands", readDemands) }); });
-app.get("/staff", async (req, res) => { res.json({ ok: true, data: await cached("staff", readStaff) }); });
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("🚀 Bridge running on port " + PORT));
