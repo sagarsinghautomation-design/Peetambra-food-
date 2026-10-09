@@ -6,7 +6,8 @@ const cors = require("cors");
 const app = express();
 app.use(cors());
 app.use(express.urlencoded({ extended: true }));
-app.use(express.json({ limit: "20mb" }));
+// 👇 Yeh text/plain aur application/json dono ko support karega
+app.use(express.json({ limit: "20mb", type: ['application/json', 'text/plain'] }));
 
 const cache = new NodeCache({ stdTTL: 120, checkperiod: 30 });
 
