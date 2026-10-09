@@ -230,7 +230,7 @@ async function readManualPurchases() {
 }
 
 async function readAttendance() {
-  const rows = await readRange(S.ATTENDANCE, "A1:R2000", "FORMATTED_VALUE");
+  const rows = await readRange(S.ATTENDANCE, "A1:R2000", "UNFORMATTED_VALUE");
   if (rows.length < 2) return [];
   const headers = rows[0].map(h => String(h).trim());
   const out = [];
