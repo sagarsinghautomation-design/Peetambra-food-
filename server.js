@@ -161,5 +161,17 @@ app.get("/test", async (req, res) => {
     res.json({ ok: false, error: e.message, stack: e.stack });
   }
 });
-
+app.get("/test2", async (req, res) => {
+  try {
+    const drive = google.drive({ version: 'v3', auth });
+    const response = await drive.files.list({
+      q: "mimeType='application/vnd.google-apps.spreadsheet'",
+      fields: 'files(id, name)',
+      spaces: 'drive'
+    });
+    res.json({ ok: true, totalFiles: response.data.files.length, files: response.data.files });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
 app.listen(PORT, () => console.log("🚀 Bridge running on port " + PORT));
