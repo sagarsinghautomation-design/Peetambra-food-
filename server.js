@@ -31,6 +31,14 @@ function normH(s) { return String(s).toLowerCase().replace(/\s+/g, " ").trim(); 
 function pad2(n) { return String(n).padStart(2, "0"); }
 function toISODate(d) { return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
 
+// 🆕 IST helpers — Indian Standard Time = UTC + 5:30
+function toISTISO(d) {
+  const dt = (d instanceof Date) ? d : new Date(d);
+  if (isNaN(dt.getTime())) return "";
+  const ist = new Date(dt.getTime() + 5.5 * 3600000);
+  return ist.toISOString().slice(0, 19); // "2026-10-09T17:30:00" (IST wall-clock)
+}
+
 function normalizeDate(v) {
   if (v === null || v === undefined || v === "") return "";
   if (v instanceof Date) return toISODate(v);
@@ -50,12 +58,20 @@ function normalizeDate(v) {
 
 function normalizeDateTime(v, dateHint) {
   if (v === null || v === undefined || v === "") return "";
-  if (v instanceof Date) return v.toISOString().slice(0, 19);
+  if (v instanceof Date) return toISTISO(v);
   const s = String(v).trim(); if (!s) return "";
+
+  // 🆕 ISO with Z suffix (UTC) → convert to IST
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/i.test(s)) {
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) return toISTISO(d);
+  }
+
+  // ISO without Z (naive IST) → keep as-is
   if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return s.slice(0, 19);
   if (/^\d{4}-\d{2}-\d{2}/.test(s)) { const d = new Date(s); if (!isNaN(d.getTime())) return d.toISOString().slice(0, 19); }
   const n = Number(s);
-  if (!isNaN(n) && n > 20000 && n < 60000) { const ms = Date.UTC(1899, 11, 30) + n * 86400000; return new Date(ms).toISOString().slice(0, 19); }
+  if (!isNaN(n) && n > 20000 && n < 60000) { const ms = Date.UTC(1899, 11, 30) + n * 86400000; return toISTISO(new Date(ms)); }
   const usFull = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?/i);
   if (usFull) {
     let h = parseInt(usFull[4]); const ap = (usFull[7] || "").toUpperCase();
@@ -69,7 +85,7 @@ function normalizeDateTime(v, dateHint) {
     return `${dateHint}T${pad2(h)}:${tOnly[2]}:${tOnly[3] || "00"}`;
   }
   const d = new Date(s);
-  if (!isNaN(d.getTime())) return d.toISOString().slice(0, 19);
+  if (!isNaN(d.getTime())) return toISTISO(d);
   return "";
 }
 
@@ -94,7 +110,6 @@ async function writeCell(sheetName, row, col, value) {
   });
 }
 
-// 👇 CRITICAL FIX: returns the actual row number of the appended row
 async function appendRow(sheetName, values) {
   const resp = await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID, range: `'${sheetName}'!A1`,
@@ -254,6 +269,68 @@ function matchVendorForItem(name) {
   return "";
 }
 
+// =================== 🆕 AUTO-PO ENGINE ===================
+async function checkAndCreateAutoPO(itemName) {
+  if (!itemName) return null;
+  const products = await cached("products", readProducts);
+  const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(itemName));
+  if (!item) return null;
+
+  const min = num(item.Min);
+  const max = num(item.Max);
+  const cur = num(item["Current Stock"]);
+
+  // Only trigger if Min set and stock at/below Min
+  if (min <= 0) return null;
+  if (cur > min) return null;
+
+  // Formula: qty = max > min ? (max - current) : (min * 2 - current)
+  let orderQty;
+  if (max > min) orderQty = Math.max(1, round3(max - cur));
+  else orderQty = Math.max(1, round3(min * 2 - cur));
+
+  // Duplicate safety: agar Pending PO pehle se hai us item ka
+  const pos = await cached("po", readPO);
+  const existingPending = pos.find(p =>
+    normH(String(p["Item Name"] || "")) === normH(itemName) &&
+    String(p.Status || "").trim() === "Pending"
+  );
+  if (existingPending) {
+    return { skipped: true, reason: "Pending PO already exists", row: existingPending._row, existingQty: existingPending["Qty Ordered"] };
+  }
+
+  const poId = "APO-" + Date.now() + "-" + Math.floor(Math.random() * 90 + 10);
+  const vendor = item.Vendor || "Unassigned";
+  const ts = toISTISO(new Date());
+  // Columns: PO ID, Timestamp, Item Name, Category, Unit, Qty, Status, Requested By, Notes, Vendor
+  await appendRow(S.PO, [
+    poId, ts, item["Item Name (Standardized)"], item.Category || "",
+    item.Unit || "", orderQty, "Pending", "AUTO-PO",
+    `Auto: Stock ${cur} <= Min ${min}`, vendor
+  ]);
+  invalidate("po", "po_batches", "mpo", "dash");
+  return { created: true, poId, itemName: item["Item Name (Standardized)"], qty: orderQty, current: cur, min, max, vendor };
+}
+
+async function runAutoPOForAll() {
+  const products = await cached("products", readProducts);
+  const results = { created: [], skipped: [], failed: [] };
+  for (const p of products) {
+    const min = num(p.Min);
+    const cur = num(p["Current Stock"]);
+    if (min > 0 && cur <= min) {
+      try {
+        const r = await checkAndCreateAutoPO(p["Item Name (Standardized)"]);
+        if (r && r.created) results.created.push(r);
+        else if (r && r.skipped) results.skipped.push({ name: p["Item Name (Standardized)"], reason: r.reason });
+      } catch (e) {
+        results.failed.push({ name: p["Item Name (Standardized)"], error: e.message });
+      }
+    }
+  }
+  return results;
+}
+
 // =================== HANDLERS ===================
 async function handleLogin(p) {
   const staff = await cached("staff", readStaff);
@@ -314,7 +391,9 @@ async function buildDashboardStats() {
   const health = { healthy: 0, low: 0, overstock: 0 };
   const categoryStock = {};
   products.forEach(p => {
-    const min = num(p.Min), max = num(p.Max), cur = num(p["Current Stock In Carton"]);
+    const min = num(p.Min), max = num(p.Max);
+    // 🔧 FIX: Compare against PCS (Current Stock), not carton
+    const cur = num(p["Current Stock"]);
     const cat = p.Category || "Other"; categoryStock[cat] = (categoryStock[cat] || 0) + num(p["Current Stock"]);
     if (min > 0 && cur <= min) health.low++; else if (max > 0 && cur >= max) health.overstock++; else health.healthy++;
   });
@@ -337,8 +416,7 @@ async function handleAddDemand(p) {
   const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(p.itemName));
   if (!item) throw new Error("Item not found: " + p.itemName);
   const id = "DMD-" + Date.now() + "-" + Math.floor(Math.random() * 90 + 10);
-  const ts = new Date().toISOString();
-  // 👇 ab actual row number return karta hai
+  const ts = toISTISO(new Date()); // 🆕 IST
   const rowNum = await appendRow(S.DEMAND, [id, ts, p.raisedBy || "", p.itemName, p.category || item.Category || "", p.unit || item.Unit || "", Number(p.qty) || 0, "Pending", "", p.notes || "", "", "", "", ""]);
   if (item._row) {
     const newDemand = num(item["Deman for canteen"]) + num(p.qty);
@@ -352,24 +430,41 @@ async function handleApproveDemands(p) {
   const items = Array.isArray(p.items) ? p.items : [];
   if (!items.length) throw new Error("Koi demand select nahi hui.");
   const results = [];
+  const autoPOs = [];
   for (const it of items) {
     try {
       const row = Number(it.row); if (!row || row < 2) throw new Error("Invalid row");
       const approved = Number(it.approvedQty);
       const feedback = (it.feedback || "").trim();
-      const nowIso = new Date().toISOString();
+      const nowIso = toISTISO(new Date()); // 🆕 IST
+
+      // Read item name before approving (for auto-PO check)
+      const demRows = await readRange(S.DEMAND, `A${row}:N${row}`, "FORMATTED_VALUE");
+      const demR = demRows[0] || [];
+      const itemName = String(demR[3] || "").trim();
+
       await writeCell(S.DEMAND, row, 8, "Approved");
       await writeCell(S.DEMAND, row, 11, isNaN(approved) ? "" : approved);
       await writeCell(S.DEMAND, row, 12, nowIso);
       if (feedback) { await writeCell(S.DEMAND, row, 13, feedback); await writeCell(S.DEMAND, row, 14, nowIso); }
+
+      // 🆕 AUTO-PO check after approval
+      if (itemName) {
+        try {
+          // Bust products cache first so we read fresh stock
+          invalidate("products");
+          const poRes = await checkAndCreateAutoPO(itemName);
+          if (poRes && poRes.created) autoPOs.push(poRes);
+        } catch (e) { console.error("AutoPO on approve:", e.message); }
+      }
+
       results.push({ row, ok: true, approvedQty: approved });
     } catch (e) { results.push({ row: it.row, ok: false, error: e.message }); }
   }
   invalidate("demands", "products", "dash");
-  return { results };
+  return { results, autoPOs };
 }
 
-// 🔧 UPDATED: reject now subtracts qty from Product Master column H
 async function handleRejectDemands(p) {
   const rows = Array.isArray(p.rows) ? p.rows.map(Number) : [];
   if (!rows.length) throw new Error("Koi demand select nahi hui.");
@@ -377,16 +472,12 @@ async function handleRejectDemands(p) {
   for (const row of rows) {
     try {
       if (!row || row < 2) throw new Error("Invalid row");
-
-      // 1. Demand row padho
       const demRows = await readRange(S.DEMAND, `A${row}:N${row}`, "FORMATTED_VALUE");
       const r = demRows[0] || [];
       const status = r[7] || "Pending";
       if (status !== "Pending") throw new Error("Ye demand pehle hi " + status + " ho chuki hai.");
       const itemName = String(r[3] || "").trim();
       const qty = num(r[6]);
-
-      // 2. Product Master se qty minus karo
       if (itemName && qty > 0) {
         const products = await cached("products", readProducts);
         const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(itemName));
@@ -396,8 +487,6 @@ async function handleRejectDemands(p) {
           await writeCell(S.PRODUCTS, item._row, 8, newDemand);
         }
       }
-
-      // 3. Demand ko Rejected mark karo
       await writeCell(S.DEMAND, row, 8, "Rejected");
       results.push({ row, ok: true, subtracted: qty });
     } catch (e) { results.push({ row, ok: false, error: e.message }); }
@@ -406,14 +495,12 @@ async function handleRejectDemands(p) {
   return { results };
 }
 
-// 🔧 UPDATED: edit now adjusts Product Master column H by diff
 async function handleEditDemand(p) {
   const row = Number(p.row);
   if (!row || row < 2) throw new Error("Invalid row");
   const newQty = Number(p.newQty);
   if (isNaN(newQty) || newQty <= 0) throw new Error("Invalid quantity");
 
-  // 1. Demand row padho
   const demRows = await readRange(S.DEMAND, `A${row}:N${row}`, "FORMATTED_VALUE");
   const r = demRows[0] || [];
   const status = r[7] || "Pending";
@@ -422,7 +509,6 @@ async function handleEditDemand(p) {
   const oldQty = num(r[6]);
   const diff = round3(newQty - oldQty);
 
-  // 2. Product Master mein difference adjust karo (agar edit badi hui to +, choti hui to -)
   if (itemName && diff !== 0) {
     const products = await cached("products", readProducts);
     const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(itemName));
@@ -433,18 +519,15 @@ async function handleEditDemand(p) {
     }
   }
 
-  // 3. Demand row mein qty update karo
   await writeCell(S.DEMAND, row, 7, newQty);
   invalidate("demands", "products", "dash");
   return { row, oldQty, newQty, diff };
 }
 
-// 🔧 UPDATED: delete now subtracts qty from Product Master column H
 async function handleDeleteDemand(p) {
   const row = Number(p.row);
   if (!row || row < 2) throw new Error("Invalid row");
 
-  // 1. Pehle demand row padho — item name + qty nikaalo
   const demRows = await readRange(S.DEMAND, `A${row}:N${row}`, "FORMATTED_VALUE");
   const r = demRows[0] || [];
   const status = r[7] || "Pending";
@@ -452,7 +535,6 @@ async function handleDeleteDemand(p) {
   const itemName = String(r[3] || "").trim();
   const qty = num(r[6]);
 
-  // 2. Product Master mein "Deman for canteen" (column H = 8) se qty minus karo
   if (itemName && qty > 0) {
     const products = await cached("products", readProducts);
     const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(itemName));
@@ -463,7 +545,6 @@ async function handleDeleteDemand(p) {
     }
   }
 
-  // 3. Demand ko Cancelled mark karo
   await writeCell(S.DEMAND, row, 8, "Cancelled");
   invalidate("demands", "products", "dash");
   return { row, subtracted: qty };
@@ -473,7 +554,7 @@ async function handleSaveDemandFeedback(p) {
   const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
   const feedback = String(p.feedback || "").trim().slice(0, 500);
   if (!feedback) throw new Error("Feedback khali hai");
-  const nowIso = new Date().toISOString();
+  const nowIso = toISTISO(new Date()); // 🆕 IST
   await writeCell(S.DEMAND, row, 13, feedback);
   await writeCell(S.DEMAND, row, 14, nowIso);
   invalidate("demands");
@@ -509,7 +590,8 @@ async function handleMarkAttendance(p) {
     if (String(rows[i][ci["User ID"]] || "").trim() === String(p.userId).trim() && normalizeDate(rows[i][ci["Date"]]) === dateStr) { todayRow = i + 1; break; }
   }
   const mapsLink = (p.lat && p.lng) ? ("https://www.google.com/maps?q=" + p.lat + "," + p.lng) : "";
-  const nowIso = now.toISOString();
+  // 🔧 FIX: Store IST wall-clock time
+  const nowIso = toISTISO(now);
   if (type === "IN") {
     if (todayRow > 0 && rows[todayRow - 1][ci["IN Time"]]) throw new Error("Aap already IN punch kar chuke ho.");
     await appendRow(S.ATTENDANCE, [dateStr, p.userId, p.name || "", p.designation || "", p.shift || "", nowIso, photoUrl, mapsLink, p.lat || "", p.lng || "", "Marked", "", "", "", "", "", "", "Present"]);
@@ -523,7 +605,7 @@ async function handleMarkAttendance(p) {
     await writeCell(S.ATTENDANCE, todayRow, ci["OUT Status"] + 1, "Marked");
   }
   invalidate("attendance", "dash");
-  return { status: "Marked", type, photoUrl };
+  return { status: "Marked", type, photoUrl, istTime: nowIso };
 }
 
 async function handleEditAttendancePunch(p) {
@@ -536,7 +618,7 @@ async function handleEditAttendancePunch(p) {
     if (String(rows[i][ci["User ID"]] || "").trim() === String(p.userId).trim() && normalizeDate(rows[i][ci["Date"]]) === p.dateISO) { ex = i + 1; break; }
   }
   if (p.inTime) {
-    const ts = p.dateISO + "T" + p.inTime + ":00";
+    const ts = p.dateISO + "T" + p.inTime + ":00"; // already IST since typed manually
     if (ex > 0) {
       await writeCell(S.ATTENDANCE, ex, ci["IN Time"] + 1, ts);
       await writeCell(S.ATTENDANCE, ex, ci["IN Photo URL"] + 1, note);
@@ -571,14 +653,14 @@ async function handleAddWarehouseEntry(p) {
   await writeCell(S.PRODUCTS, item._row, 7, newLoose);
   if (p.rate) await writeCell(S.PRODUCTS, item._row, 17, Number(p.rate));
   if (p.expiryDate) await writeCell(S.PRODUCTS, item._row, 19, p.expiryDate);
-  const logRow = await appendRow(S.WHLOG, ["WH-" + Date.now(), new Date().toISOString(), item["Item Name (Standardized)"], "add", qty, item["Current Stock"], round3(num(item["Current Stock"]) + qty), p.enteredBy || "", ""]);
+  const logRow = await appendRow(S.WHLOG, ["WH-" + Date.now(), toISTISO(new Date()), item["Item Name (Standardized)"], "add", qty, item["Current Stock"], round3(num(item["Current Stock"]) + qty), p.enteredBy || "", ""]);
   invalidate("products", "whlog", "dash");
   return { itemName: item["Item Name (Standardized)"], newValue: round3(num(item["Current Stock"]) + qty), row: logRow };
 }
 async function handleEditWarehouseEntry(p) {
   const row = Number(p.logRow); if (!row || row < 2) throw new Error("Invalid row");
   await writeCell(S.WHLOG, row, 5, Number(p.newQty) || 0);
-  await writeCell(S.WHLOG, row, 9, new Date().toISOString());
+  await writeCell(S.WHLOG, row, 9, toISTISO(new Date()));
   invalidate("whlog", "products", "dash");
   return { row };
 }
@@ -602,14 +684,14 @@ async function handleAddCylinderEntry(p) {
       photoUrl = (j && (j.url || (j.data && j.data.url))) || "";
     } catch (e) {}
   }
-  await appendRow(S.CYLINDER, ["CYL-" + Date.now(), new Date().toISOString(), p.receivedBy || "", qty, price, total, photoUrl]);
+  await appendRow(S.CYLINDER, ["CYL-" + Date.now(), toISTISO(new Date()), p.receivedBy || "", qty, price, total, photoUrl]);
   invalidate("cyl", "dash");
   return { qty, price, total, photoUrl };
 }
 
 // =================== PO HANDLERS ===================
 async function handleAddPurchaseOrder(p) {
-  await appendRow(S.PO, ["PO-" + Date.now(), new Date().toISOString(), p.itemName, p.category || "", p.unit || "", Number(p.qty) || 0, "Pending", p.requestedBy || "", p.notes || ""]);
+  await appendRow(S.PO, ["PO-" + Date.now(), toISTISO(new Date()), p.itemName, p.category || "", p.unit || "", Number(p.qty) || 0, "Pending", p.requestedBy || "", p.notes || ""]);
   invalidate("po", "po_batches");
   return { id: "PO-" + Date.now() };
 }
@@ -675,7 +757,7 @@ async function handleAddManualPurchase(p) {
   await writeCell(S.PRODUCTS, item._row, 11, newPurchase);
   if (p.rate) await writeCell(S.PRODUCTS, item._row, 17, Number(p.rate));
   if (p.expiryDate) await writeCell(S.PRODUCTS, item._row, 19, p.expiryDate);
-  await appendRow(S.PO, ["MPO-" + Date.now(), new Date().toISOString(), item["Item Name (Standardized)"], p.category || item.Category || "", p.unit || item.Unit || "", qty, "Received (Manual)", p.enteredBy || "", "Manual purchase entry"]);
+  await appendRow(S.PO, ["MPO-" + Date.now(), toISTISO(new Date()), item["Item Name (Standardized)"], p.category || item.Category || "", p.unit || item.Unit || "", qty, "Received (Manual)", p.enteredBy || "", "Manual purchase entry"]);
   invalidate("products", "po", "dash", "mpo");
   return { itemName: item["Item Name (Standardized)"], newValue: round3(num(item["Current Stock"]) + qty) };
 }
@@ -790,8 +872,19 @@ app.all("/", async (req, res) => {
     else if (action === "getDashboardStats") data = await buildDashboardStats();
     else if (action === "getLowStockAlerts") {
       const products = await cached("products", readProducts);
-      data = products.filter(p => { const min = num(p.Min), max = num(p.Max), cur = num(p["Current Stock In Carton"]); return (min > 0 && cur <= min) || (max > 0 && cur >= max); })
-        .map(p => ({ "Item Name": p["Item Name (Standardized)"], Category: p.Category, Unit: p.Unit, "Current Stock": p["Current Stock"], "Min Stock": p.Min, "Max Stock": p.Max, "Status": (num(p.Min) > 0 && num(p["Current Stock In Carton"]) <= num(p.Min)) ? "LOW" : "OVERSTOCK" }));
+      // 🔧 FIX: Compare against Current Stock (pcs), not carton
+      data = products.filter(p => {
+        const min = num(p.Min), max = num(p.Max), cur = num(p["Current Stock"]);
+        return (min > 0 && cur <= min) || (max > 0 && cur >= max);
+      }).map(p => ({
+        "Item Name": p["Item Name (Standardized)"],
+        Category: p.Category,
+        Unit: p.Unit,
+        "Current Stock": p["Current Stock"],
+        "Min Stock": p.Min,
+        "Max Stock": p.Max,
+        "Status": (num(p.Min) > 0 && num(p["Current Stock"]) <= num(p.Min)) ? "LOW" : "OVERSTOCK"
+      }));
     }
     else if (action === "getWarehouseEntries") data = await cached("whlog", readWarehouseEntries);
     else if (action === "getCylinderEntries") data = await cached("cyl", readCylinderEntries);
@@ -833,6 +926,9 @@ app.all("/", async (req, res) => {
     else if (action === "addStaff") data = await handleAddStaff(payload);
     else if (action === "updateStaff") data = await handleUpdateStaff(payload);
     else if (action === "deleteStaff") data = await handleDeleteStaff(payload);
+    // 🆕 AUTO-PO actions
+    else if (action === "runAutoPO") data = await runAutoPOForAll();
+    else if (action === "checkAutoPOForItem") data = await checkAndCreateAutoPO(payload.itemName);
     else if (action === "uploadPhoto") {
       let url = "";
       try {
