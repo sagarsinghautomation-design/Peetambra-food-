@@ -151,4 +151,15 @@ app.all("/", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
+
+// 👇 Yeh sirf testing ke liye hai, baad mein isko delete kar sakte ho
+app.get("/test", async (req, res) => {
+  try {
+    const data = await readStaff();
+    res.json({ ok: true, message: "Google Sheet Connection Successful!", totalStaff: data.length, firstRow: data[0] });
+  } catch (e) {
+    res.json({ ok: false, error: e.message, stack: e.stack });
+  }
+});
+
 app.listen(PORT, () => console.log("🚀 Bridge running on port " + PORT));
