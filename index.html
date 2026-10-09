@@ -929,7 +929,7 @@ async function renderMyDashboard() {
   const totalHours = Math.round(thisMonthSessions.reduce((sum,s) => sum + (s.hours||0), 0) * 10) / 10;
   const lateCount = thisMonthSessions.filter(s => s.inStatus === 'Late').length;
   const todaySession = sessions.find(s => localDateKey(s.dateObj) === currentBusinessDayKey());
-  const todayStatus = !todaySession ? 'Not marked yet' : !todaySession.outTime ? `Clocked in ${todaySession.inTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}` : `${todaySession.hours}h completed`;
+  const todayStatus = !todaySession ? 'Not marked yet' : !todaySession.outTime ? `Clocked in ${formatTimeWithDate(todaySession.inTime)}` : `${todaySession.hours}h completed`;
   // The table itself shows the WHOLE month, day by day — any day with zero
   // activity is filled in as Leave (never for today or future days).
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -953,8 +953,8 @@ async function renderMyDashboard() {
       }
       const pill = s.inStatus==='Late'?'pill-warn':'pill-ok';
       return `<tr><td>${s.dateObj.toLocaleDateString()}</td>
-      <td>${s.inTime ? s.inTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—'}${s.inModifiedNote ? `<div style="font-size:10px;color:var(--orange-dark);font-weight:600;margin-top:2px;">✏️ IN time modified by admin</div>` : ''}</td>
-            <td>${s.outTime ? s.outTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—'}${s.outIsNextDay ? `<div style="font-size:10px;color:var(--orange-dark);font-weight:700;margin-top:2px;">📅 Next day (${s.outDateObj.toLocaleDateString('en-GB', {day:'numeric', month:'short'})})</div>` : ''}${s.outModifiedNote ? `<div style="font-size:10px;color:var(--orange-dark);font-weight:600;margin-top:2px;">✏️ OUT time modified by admin</div>` : ''}</td>
+      <td>${s.inTime ? formatTimeWithDate(s.inTime) : '—'}${s.inModifiedNote ? `<div style="font-size:10px;color:var(--orange-dark);font-weight:600;margin-top:2px;">✏️ IN time modified by admin</div>` : ''}</td>
+            <td>${s.outTime ? formatTimeWithDate(s.outTime) : '—'}${s.outModifiedNote ? `<div style="font-size:10px;color:var(--orange-dark);font-weight:600;margin-top:2px;">✏️ OUT time modified by admin</div>` : ''}</td>
       <td>${s.complete ? s.hours+'h' : '—'}</td>
       <td><span class="pill ${pill}">${s.inStatus||'—'}</span>${dayStatusBadge(s.dayStatus)}</td>
       <td>${photoThumb(s.inPhoto)}</td>
@@ -1019,6 +1019,15 @@ let ATT_NEXT_TYPE = 'IN';
 // writes that note there since a manual correction has no live photo.
 function isModifiedNote(val) {
   return val && !String(val).startsWith('http') ? String(val) : null;
+}
+// Time ke saath date bhi dikhata hai — jaise "09:45 AM (9 Oct)"
+function formatTimeWithDate(dt) {
+  if (!dt) return '—';
+  const d = new Date(dt);
+  if (isNaN(d.getTime())) return '—';
+  const t = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  const dt2 = d.toLocaleDateString('en-GB', {day:'numeric', month:'short'});
+  return `${t} <span style="color:var(--ink-soft);font-size:11px;">(${dt2})</span>`;
 }
 function pairAttendance(rows) {
   return rows.map(r => {
@@ -1116,7 +1125,7 @@ async function renderAttendance() {
           <div style="font-size:44px;">✅</div>
           <h3 style="font-size:16px;font-weight:700;margin:12px 0 4px;">Aaj ka din complete!</h3>
           <p style="color:var(--ink-soft);font-size:13px;">
-            IN ${todaySession.inTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} · OUT ${todaySession.outTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}
+            IN ${formatTimeWithDate(todaySession.inTime)} · OUT ${formatTimeWithDate(todaySession.outTime)}
             ${todaySession.complete ? ` · ${todaySession.hours}h worked` : ''}
           </p>
           <p style="color:var(--ink-soft);font-size:12px;margin-top:6px;">Kal phir milte hain 🙏</p>
@@ -1127,7 +1136,7 @@ async function renderAttendance() {
           <span class="pill pill-mute">Shift (ref): ${u.shift}</span>
         </div>
         <p style="color:var(--ink-soft);font-size:12.5px;margin:0 0 14px;">
-          ${u.name} · ${u.designation}${todaySession && todaySession.inTime && ATT_NEXT_TYPE==='OUT' ? ` · Clocked in at ${todaySession.inTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}` : ''}
+          ${u.name} · ${u.designation}${todaySession && todaySession.inTime && ATT_NEXT_TYPE==='OUT' ? ` · Clocked in at ${formatTimeWithDate(todaySession.inTime)}` : ''}
         </p>
         <div id="punchStartBox">
           <button class="btn btn-primary w-full" style="padding:22px;font-size:17px;" onclick="beginPunch()">${ATT_NEXT_TYPE==='IN' ? '📷 Punch IN' : '📷 Punch OUT'}</button>
@@ -1194,8 +1203,8 @@ function renderAttHistory(sessions) {
         ${s.complete ? `<span class="pill pill-ok">${s.hours}h</span>` : `<span class="pill pill-warn">Ongoing</span>`}
       </div>
       <div class="flex gap-3 mt-1" style="font-size:11.5px;">
-        <span class="pill ${inPill}">IN ${s.inTime ? s.inTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—'}</span>
-        <span class="pill ${outPill}">OUT ${s.outTime ? s.outTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—'}</span>
+        <span class="pill ${inPill}">IN ${s.inTime ? formatTimeWithDate(s.inTime) : '—'}</span>
+        <span class="pill ${outPill}">OUT ${s.outTime ? formatTimeWithDate(s.outTime) : '—'}</span>
       </div>
       ${(s.inModifiedNote || s.outModifiedNote) ? `<div style="font-size:10.5px;color:var(--orange-dark);font-weight:600;margin-top:4px;">✏️ ${s.inModifiedNote ? 'IN' : ''}${s.inModifiedNote && s.outModifiedNote ? ' & ' : ''}${s.outModifiedNote ? 'OUT' : ''} time modified by admin</div>` : ''}
     </div>`;
@@ -3327,8 +3336,8 @@ function renderReportsBody() {
         <td><span class="pill" style="background:#fee2e2;color:#b91c1c;">Leave</span></td>
       </tr>` : `<tr>
         <td style="font-weight:600;">${s.dateObj.toLocaleDateString()}</td>
-        <td>${s.inTime ? s.inTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—'}</td>
-        <td>${s.outTime ? s.outTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—'}</td>
+        <td>${s.inTime ? formatTimeWithDate(s.inTime) : '—'}</td>
+        <td>${s.outTime ? formatTimeWithDate(s.outTime) : '—'}</td>
         <td style="font-weight:700;color:var(--orange-dark);">${s.complete ? s.hours+'h' : '—'}</td>
         <td><span class="pill ${s.inStatus==='Late'?'pill-warn':s.inTime?'pill-ok':'pill-mute'}">${s.inStatus||'Not marked'}</span>${dayStatusBadge(s.dayStatus)}</td>
       </tr>`).join('') : `<tr><td colspan="5" style="text-align:center;color:var(--ink-soft);padding:24px;">No attendance in this range.</td></tr>`}</tbody></table>
@@ -3397,8 +3406,8 @@ function renderReportsBody() {
       return `<tr>
       <td style="font-weight:600;">${s.name}</td>
       <td>${s.dateObj.toLocaleDateString()}</td>
-      <td><span class="pill ${s.inStatus==='Late'?'pill-warn':s.inTime?'pill-ok':'pill-mute'}">${s.inTime ? s.inTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—'}</span></td>
-      <td><span class="pill ${(s.outStatus==='Early Leave'||s.outStatus==='Overtime')?'pill-warn':s.outTime?'pill-ok':'pill-mute'}">${s.outTime ? s.outTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—'}</span></td>
+      <td><span class="pill ${s.inStatus==='Late'?'pill-warn':s.inTime?'pill-ok':'pill-mute'}">${s.inTime ? formatTimeWithDate(s.inTime) : '—'}</span></td>
+      <td><span class="pill ${(s.outStatus==='Early Leave'||s.outStatus==='Overtime')?'pill-warn':s.outTime?'pill-ok':'pill-mute'}">${s.outTime ? formatTimeWithDate(s.outTime) : '—'}</span></td>
       <td style="font-weight:700;color:var(--orange-dark);">${s.complete ? s.hours+'h' : '—'}</td>
       <td style="font-size:12px;">${s.inStatus||'—'}${s.outStatus ? (' / ' + s.outStatus) : ''}${dayStatusBadge(s.dayStatus)}</td>
       <td>${mapsLink ? `<a href="${mapsLink}" target="_blank" style="color:var(--orange-dark);">View map</a>` : '—'}</td>
@@ -3493,8 +3502,8 @@ function renderAcAllTable() {
     <td>—</td><td>—</td>
   </tr>` : `<tr>
     <td style="font-weight:600;">${s.name}</td><td>${s.dateObj.toLocaleDateString()}</td>
-    <td><span class="pill ${s.inStatus==='Late'?'pill-warn':s.inTime?'pill-ok':'pill-mute'}">${s.inTime ? s.inTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—'}</span>${s.inModifiedNote ? `<div style="font-size:10px;color:var(--orange-dark);font-weight:600;margin-top:2px;">✏️ modified</div>` : ''}</td>
-    <td><span class="pill ${(s.outStatus==='Early Leave'||s.outStatus==='Overtime')?'pill-warn':s.outTime?'pill-ok':'pill-mute'}">${s.outTime ? s.outTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—'}</span>${s.outModifiedNote ? `<div style="font-size:10px;color:var(--orange-dark);font-weight:600;margin-top:2px;">✏️ modified</div>` : ''}</td>
+    <td><span class="pill ${s.inStatus==='Late'?'pill-warn':s.inTime?'pill-ok':'pill-mute'}">${s.inTime ? formatTimeWithDate(s.inTime) : '—'}</span>${s.inModifiedNote ? `<div style="font-size:10px;color:var(--orange-dark);font-weight:600;margin-top:2px;">✏️ modified</div>` : ''}</td>
+    <td><span class="pill ${(s.outStatus==='Early Leave'||s.outStatus==='Overtime')?'pill-warn':s.outTime?'pill-ok':'pill-mute'}">${s.outTime ? formatTimeWithDate(s.outTime) : '—'}</span>${s.outModifiedNote ? `<div style="font-size:10px;color:var(--orange-dark);font-weight:600;margin-top:2px;">✏️ modified</div>` : ''}</td>
     <td style="font-weight:700;color:var(--orange-dark);">${s.complete ? s.hours+'h' : '—'}</td>
     <td style="font-size:12px;">${s.inStatus||'—'}${s.outStatus ? (' / '+s.outStatus) : ''}${dayStatusBadge(s.dayStatus)}</td>
     <td>${photoThumb(s.inPhoto)}</td>
@@ -3551,8 +3560,8 @@ async function exportAttendanceCSV() {
     sessions.sort((a,b)=>a.dateObj-b.dateObj || a.name.localeCompare(b.name)).forEach(s => {
       rows.push([
         s.name, s.designation, s.dateObj.toLocaleDateString(),
-        s.inTime ? s.inTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '',
-        s.outTime ? s.outTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '',
+        s.inTime ? s.inTime.toLocaleString('en-GB', {day:'numeric', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit'}) : '',
+        s.outTime ? s.outTime.toLocaleString('en-GB', {day:'numeric', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit'}) : '',
         s.complete ? s.hours : '', s.inStatus || '', s.shift || '',
       ]);
     });
