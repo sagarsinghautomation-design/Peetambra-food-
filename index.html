@@ -954,7 +954,7 @@ async function renderMyDashboard() {
       const pill = s.inStatus==='Late'?'pill-warn':'pill-ok';
       return `<tr><td>${s.dateObj.toLocaleDateString()}</td>
       <td>${s.inTime ? s.inTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—'}${s.inModifiedNote ? `<div style="font-size:10px;color:var(--orange-dark);font-weight:600;margin-top:2px;">✏️ IN time modified by admin</div>` : ''}</td>
-      <td>${s.outTime ? s.outTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—'}${s.outModifiedNote ? `<div style="font-size:10px;color:var(--orange-dark);font-weight:600;margin-top:2px;">✏️ OUT time modified by admin</div>` : ''}</td>
+            <td>${s.outTime ? s.outTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—'}${s.outIsNextDay ? `<div style="font-size:10px;color:var(--orange-dark);font-weight:700;margin-top:2px;">📅 Next day (${s.outDateObj.toLocaleDateString('en-GB', {day:'numeric', month:'short'})})</div>` : ''}${s.outModifiedNote ? `<div style="font-size:10px;color:var(--orange-dark);font-weight:600;margin-top:2px;">✏️ OUT time modified by admin</div>` : ''}</td>
       <td>${s.complete ? s.hours+'h' : '—'}</td>
       <td><span class="pill ${pill}">${s.inStatus||'—'}</span>${dayStatusBadge(s.dayStatus)}</td>
       <td>${photoThumb(s.inPhoto)}</td>
@@ -1023,18 +1023,37 @@ function isModifiedNote(val) {
 function pairAttendance(rows) {
   return rows.map(r => {
     const inTime = r['IN Time'] ? new Date(r['IN Time']) : null;
-    const outTime = r['OUT Time'] ? new Date(r['OUT Time']) : null;
-    let hours = 0, complete = false;
-    if (inTime && outTime && outTime > inTime) { hours = (outTime - inTime) / 3600000; complete = true; }
+    let outTime = r['OUT Time'] ? new Date(r['OUT Time']) : null;
+    let hours = 0, complete = false, outIsNextDay = false, outDateObj = null;
+    
+    if (inTime && outTime) {
+      // Agar OUT time IN se pehle ya barabar hai, toh samjho ki OUT agle din hua
+      // (e.g. IN 12:53 PM, OUT 12:00 AM next day)
+      if (outTime.getTime() <= inTime.getTime()) {
+        outTime = new Date(outTime.getTime() + 24 * 60 * 60 * 1000);
+        outIsNextDay = true;
+      }
+      outDateObj = new Date(outTime);
+      if (outTime > inTime) {
+        hours = (outTime - inTime) / 3600000;
+        complete = true;
+      }
+    }
+    
+    // Business day check: agar IN 3 AM se pehle hua, toh previous day ka business day hai
+    // (Yeh already sheet ke Date column mein handle hai — yahan sirf verify kar rahe hain)
+    const dateObj = new Date(r['Date']);
+    
     return {
-      userId: r['User ID'], name: r['Name'], designation: r['Designation'], shift: r['Shift'],
-      dateObj: new Date(r['Date']),
-      inTime, outTime, inStatus: r['IN Status'] || null, outStatus: r['OUT Status'] || null,
+           userId: r['User ID'], name: r['Name'], designation: r['Designation'], shift: r['Shift'],
+      dateObj: dateObj,
+      inTime: inTime, outTime: outTime, outIsNextDay: outIsNextDay, outDateObj: outDateObj,
+      inStatus: r['IN Status'] || null, outStatus: r['OUT Status'] || null,
       inPhoto: r['IN Photo URL'] || '', outPhoto: r['OUT Photo URL'] || '',
       inMapsLink: r['IN Maps Link'] || '', outMapsLink: r['OUT Maps Link'] || '',
       inModifiedNote: isModifiedNote(r['IN Photo URL']), outModifiedNote: isModifiedNote(r['OUT Photo URL']),
       hours: Math.round(hours * 10) / 10, complete,
-      dayStatus: r['Day Status'] || null, // "Leave" once the daily 3 AM auto-mark closes out a missed punch-out
+      dayStatus: r['Day Status'] || null,
     };
   }).sort((a, b) => b.dateObj - a.dateObj || (b.inTime || 0) - (a.inTime || 0));
 }
