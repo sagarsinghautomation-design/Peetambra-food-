@@ -137,6 +137,72 @@ async function cached(key, builder) {
 }
 function invalidate(...keys) { keys.forEach(k => cache.del(k)); }
 
+// =================== 🆕 PHOTO UPLOAD (Apps Script → Google Drive) ===================
+// Photo Google Drive mein Apps Script ke through save hoti hai. Agar upload fail ho
+// to error Render Logs mein dikhega (pehle silently chhup jata tha).
+async function uploadPhotoToDrive(photoBase64, userId, name) {
+  if (!photoBase64) return "";
+  if (!APPS_SCRIPT_URL) { console.error("Photo upload skipped: APPS_SCRIPT_URL env variable set nahi hai"); return ""; }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60000);
+  try {
+    const r = await fetch(APPS_SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ action: "uploadPhoto", photoBase64, userId: userId || "photo", name: name || "photo" }),
+      signal: controller.signal,
+    });
+    const txt = await r.text();
+    let j;
+    try { j = JSON.parse(txt); } catch (e) { console.error("Photo upload: JSON nahi mila. Response:", txt.slice(0, 200)); return ""; }
+    const url = (j && (j.url || (j.data && j.data.url))) || "";
+    if (!url) console.error("Photo upload failed:", JSON.stringify(j).slice(0, 300));
+    return url;
+  } catch (e) {
+    console.error("Photo upload error:", e.message);
+    return "";
+  } finally { clearTimeout(timer); }
+}
+
+// =================== 🆕 SHIFT STATUS (On Time / Late / Early Leave / Overtime) ===================
+function parseClock(str) {
+  const m = String(str).match(/(\d+):(\d+)\s*(AM|PM)/i);
+  if (!m) return null;
+  let h = Number(m[1]) % 12;
+  if (m[3].toUpperCase() === "PM") h += 12;
+  return h * 60 + Number(m[2]);
+}
+function istMinutes(d) {
+  const t = new Date(d.getTime() + 5.5 * 3600000);
+  return t.getUTCHours() * 60 + t.getUTCMinutes();
+}
+function computeInStatusAt(shift, minutes) {
+  try {
+    const start = parseClock(String(shift).split("-")[0].trim());
+    if (start === null) return "Marked";
+    return minutes > start + 15 ? "Late" : "On Time";
+  } catch (e) { return "Marked"; }
+}
+function computeOutStatusAt(shift, minutes) {
+  try {
+    const parts = String(shift).split("-");
+    const start = parseClock(parts[0].trim());
+    let end = parseClock((parts[1] || "").trim());
+    if (start === null || end === null) return "Marked";
+    let n = minutes;
+    if (end <= start) { end += 1440; if (n < start) n += 1440; } // overnight shift (jaise 6 PM - 2 AM)
+    if (n < end - 60) return "Early Leave";
+    if (n > end + 30) return "Overtime";
+    return "On Time";
+  } catch (e) { return "Marked"; }
+}
+function computeInStatus(shift, now) { return computeInStatusAt(shift, istMinutes(now)); }
+function computeOutStatus(shift, now) { return computeOutStatusAt(shift, istMinutes(now)); }
+function hmToMinutes(hm) {
+  const m = String(hm || "").match(/^(\d{1,2}):(\d{2})/);
+  return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+}
+
 // =================== READERS ===================
 async function readStaff() { return rowsToObjects(await readRange(S.STAFF)); }
 
@@ -573,14 +639,7 @@ async function handleMarkAttendance(p) {
   const now = new Date();
   const dateStr = businessDateKey(now);
   const type = p.type === "OUT" ? "OUT" : "IN";
-  let photoUrl = "";
-  if (p.photoBase64 && APPS_SCRIPT_URL) {
-    try {
-      const r = await fetch(APPS_SCRIPT_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "uploadPhoto", photoBase64: p.photoBase64, userId: p.userId, name: p.userId }) });
-      const j = await r.json();
-      photoUrl = (j && (j.url || (j.data && j.data.url))) || "";
-    } catch (e) { console.error("Photo:", e.message); }
-  }
+
   const rows = await readRange(S.ATTENDANCE, "A1:R2000", "FORMATTED_VALUE");
   if (rows.length < 1) throw new Error("Attendance sheet khaali");
   const headers = rows[0].map(h => String(h).trim());
@@ -589,23 +648,35 @@ async function handleMarkAttendance(p) {
   for (let i = 1; i < rows.length; i++) {
     if (String(rows[i][ci["User ID"]] || "").trim() === String(p.userId).trim() && normalizeDate(rows[i][ci["Date"]]) === dateStr) { todayRow = i + 1; break; }
   }
+
+  // 🆕 Pehle validate karo — rejected punch par photo upload nahi hogi
+  if (type === "IN" && todayRow > 0 && rows[todayRow - 1][ci["IN Time"]]) throw new Error("Aap already IN punch kar chuke ho.");
+  if (type === "OUT") {
+    if (todayRow <= 0) throw new Error("Pehle IN punch karo.");
+    if (rows[todayRow - 1][ci["OUT Time"]]) throw new Error("Aap already OUT punch kar chuke ho.");
+  }
+
+  // 🆕 Photo upload (Apps Script → Drive). Fail hone par error Render Logs mein dikhega.
+  const photoUrl = await uploadPhotoToDrive(p.photoBase64, p.userId, p.name || p.userId);
+
   const mapsLink = (p.lat && p.lng) ? ("https://www.google.com/maps?q=" + p.lat + "," + p.lng) : "";
   // 🔧 FIX: Store IST wall-clock time
   const nowIso = toISTISO(now);
+  let status;
   if (type === "IN") {
-    if (todayRow > 0 && rows[todayRow - 1][ci["IN Time"]]) throw new Error("Aap already IN punch kar chuke ho.");
-    await appendRow(S.ATTENDANCE, [dateStr, p.userId, p.name || "", p.designation || "", p.shift || "", nowIso, photoUrl, mapsLink, p.lat || "", p.lng || "", "Marked", "", "", "", "", "", "", "Present"]);
+    status = computeInStatus(p.shift, now); // On Time / Late
+    await appendRow(S.ATTENDANCE, [dateStr, p.userId, p.name || "", p.designation || "", p.shift || "", nowIso, photoUrl, mapsLink, p.lat || "", p.lng || "", status, "", "", "", "", "", "", "Present"]);
   } else {
-    if (todayRow <= 0) throw new Error("Pehle IN punch karo.");
+    status = computeOutStatus(p.shift, now); // On Time / Early Leave / Overtime
     await writeCell(S.ATTENDANCE, todayRow, ci["OUT Time"] + 1, nowIso);
     await writeCell(S.ATTENDANCE, todayRow, ci["OUT Photo URL"] + 1, photoUrl);
     await writeCell(S.ATTENDANCE, todayRow, ci["OUT Maps Link"] + 1, mapsLink);
     await writeCell(S.ATTENDANCE, todayRow, ci["OUT Latitude"] + 1, p.lat || "");
     await writeCell(S.ATTENDANCE, todayRow, ci["OUT Longitude"] + 1, p.lng || "");
-    await writeCell(S.ATTENDANCE, todayRow, ci["OUT Status"] + 1, "Marked");
+    await writeCell(S.ATTENDANCE, todayRow, ci["OUT Status"] + 1, status);
   }
   invalidate("attendance", "dash");
-  return { status: "Marked", type, photoUrl, istTime: nowIso };
+  return { status, type, photoUrl, istTime: nowIso };
 }
 
 async function handleEditAttendancePunch(p) {
@@ -619,11 +690,14 @@ async function handleEditAttendancePunch(p) {
   }
   if (p.inTime) {
     const ts = p.dateISO + "T" + p.inTime + ":00"; // already IST since typed manually
+    const inMin = hmToMinutes(p.inTime);
+    const inStatus = inMin === null ? "Marked" : computeInStatusAt(p.shift, inMin);
     if (ex > 0) {
       await writeCell(S.ATTENDANCE, ex, ci["IN Time"] + 1, ts);
       await writeCell(S.ATTENDANCE, ex, ci["IN Photo URL"] + 1, note);
+      if (ci["IN Status"] !== undefined) await writeCell(S.ATTENDANCE, ex, ci["IN Status"] + 1, inStatus);
     } else {
-      await appendRow(S.ATTENDANCE, [p.dateISO, p.userId, p.name, p.designation, p.shift, ts, note, "", "", "", "Marked", "", "", "", "", "", "", "Present"]);
+      await appendRow(S.ATTENDANCE, [p.dateISO, p.userId, p.name, p.designation, p.shift, ts, note, "", "", "", inStatus, "", "", "", "", "", "", "Present"]);
     }
   }
   if (p.outTime) {
@@ -636,8 +710,11 @@ async function handleEditAttendancePunch(p) {
     }
     if (ex2 <= 0) throw new Error("Pehle IN set karo");
     const ts = p.dateISO + "T" + p.outTime + ":00";
+    const outMin = hmToMinutes(p.outTime);
+    const outStatus = outMin === null ? "Marked" : computeOutStatusAt(p.shift, outMin);
     await writeCell(S.ATTENDANCE, ex2, ci["OUT Time"] + 1, ts);
     await writeCell(S.ATTENDANCE, ex2, ci["OUT Photo URL"] + 1, note);
+    if (ci["OUT Status"] !== undefined) await writeCell(S.ATTENDANCE, ex2, ci["OUT Status"] + 1, outStatus);
   }
   invalidate("attendance", "dash");
   return { ok: true };
@@ -676,14 +753,8 @@ async function handleAddCylinderEntry(p) {
   const qty = Number(p.qty) || 0; if (qty <= 0) throw new Error("Invalid quantity");
   const price = Number(await getSetting("CylinderPrice", "2900")) || 2900;
   const total = qty * price;
-  let photoUrl = "";
-  if (p.photoBase64 && APPS_SCRIPT_URL) {
-    try {
-      const r = await fetch(APPS_SCRIPT_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "uploadPhoto", photoBase64: p.photoBase64, userId: "cyl_" + Date.now(), name: "cyl" }) });
-      const j = await r.json();
-      photoUrl = (j && (j.url || (j.data && j.data.url))) || "";
-    } catch (e) {}
-  }
+  // userId "cyl_..." se Apps Script photo ko "Peetambra Cylinder Photos" folder mein rakhta hai
+  const photoUrl = await uploadPhotoToDrive(p.photoBase64, "cyl_" + Date.now(), "cyl");
   await appendRow(S.CYLINDER, ["CYL-" + Date.now(), toISTISO(new Date()), p.receivedBy || "", qty, price, total, photoUrl]);
   invalidate("cyl", "dash");
   return { qty, price, total, photoUrl };
@@ -930,12 +1001,7 @@ app.all("/", async (req, res) => {
     else if (action === "runAutoPO") data = await runAutoPOForAll();
     else if (action === "checkAutoPOForItem") data = await checkAndCreateAutoPO(payload.itemName);
     else if (action === "uploadPhoto") {
-      let url = "";
-      try {
-        const r = await fetch(APPS_SCRIPT_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "uploadPhoto", photoBase64: payload.photoBase64, userId: payload.userId || "photo", name: payload.name || "photo" }) });
-        const j = await r.json();
-        url = (j && (j.url || (j.data && j.data.url))) || "";
-      } catch (e) {}
+      const url = await uploadPhotoToDrive(payload.photoBase64, payload.userId || "photo", payload.name || "photo");
       data = { url };
     }
     else data = { note: "Action not implemented yet: " + action };
