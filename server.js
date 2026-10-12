@@ -137,6 +137,19 @@ async function cached(key, builder) {
 }
 function invalidate(...keys) { keys.forEach(k => cache.del(k)); }
 
+// =================== 🆕 DUPLICATE-REQUEST GUARD (_rid) ===================
+// Frontend har write request ke saath ek unique "_rid" bhejta hai. Network slow hone par
+// frontend wahi request dobara bhejta hai (same _rid). Yahan us _rid ko 10 minute yaad
+// rakhte hain: pehli request chal rahi ho ya ho chuki ho to dobara aane par wahi result
+// wapas bhej dete hain — naya save NAHI hota. Agar pehli request fail hui thi to _rid
+// hata dete hain, taaki retry sach mein dobara try ho sake.
+const RID_TTL_MS = 10 * 60 * 1000;
+const ridStore = new Map(); // key -> { t, promise }
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of ridStore) if (now - v.t > RID_TTL_MS) ridStore.delete(k);
+}, 60 * 1000).unref();
+
 // =================== 🆕 PHOTO UPLOAD (Apps Script → Google Drive) ===================
 // Photo Google Drive mein Apps Script ke through save hoti hai. Agar upload fail ho
 // to error Render Logs mein dikhega (pehle silently chhup jata tha).
@@ -966,86 +979,111 @@ async function readPOBatches() {
   return list.sort((a, b) => (order[a.status] - order[b.status]));
 }
 
+// =================== ACTION DISPATCHER ===================
+// Saare actions yahin se chalte hain. Router isko seedha ya _rid guard ke through call karta hai.
+async function dispatchAction(action, payload) {
+  let data;
+  if (action === "login") data = await handleLogin(payload);
+  else if (action === "bootstrap") data = await handleBootstrap(payload);
+  else if (action === "poll") data = await buildPoll();
+  else if (action === "getProducts") data = await cached("products", readProducts);
+  else if (action === "getCategories") data = [...new Set((await cached("products", readProducts)).map(p => p.Category).filter(Boolean))].sort();
+  else if (action === "getStaff") data = await cached("staff", readStaff);
+  else if (action === "getVendors") data = await cached("vendors", readVendors);
+  else if (action === "getDemands") data = await cached("demands", readDemands);
+  else if (action === "getDashboardStats") data = await buildDashboardStats();
+  else if (action === "getLowStockAlerts") {
+    const products = await cached("products", readProducts);
+    // 🔧 FIX: Compare against Current Stock (pcs), not carton
+    data = products.filter(p => {
+      const min = num(p.Min), max = num(p.Max), cur = num(p["Current Stock"]);
+      return (min > 0 && cur <= min) || (max > 0 && cur >= max);
+    }).map(p => ({
+      "Item Name": p["Item Name (Standardized)"],
+      Category: p.Category,
+      Unit: p.Unit,
+      "Current Stock": p["Current Stock"],
+      "Min Stock": p.Min,
+      "Max Stock": p.Max,
+      "Status": (num(p.Min) > 0 && num(p["Current Stock"]) <= num(p.Min)) ? "LOW" : "OVERSTOCK"
+    }));
+  }
+  else if (action === "getWarehouseEntries") data = await cached("whlog", readWarehouseEntries);
+  else if (action === "getCylinderEntries") data = await cached("cyl", readCylinderEntries);
+  else if (action === "getCylinderPrice") data = Number(await getSetting("CylinderPrice", "2900")) || 2900;
+  else if (action === "getPOBatches") data = await cached("po_batches", readPOBatches);
+  else if (action === "getPurchaseOrders") data = await cached("po", readPO);
+  else if (action === "getManualPurchases") data = await cached("mpo", readManualPurchases);
+  else if (action === "getAttendance") {
+    let att = await cached("attendance", readAttendance);
+    if (payload.userId) att = att.filter(r => String(r["User ID"]).toLowerCase().trim() === String(payload.userId).toLowerCase().trim());
+    data = att;
+  }
+  else if (action === "addProduct") data = await handleAddProduct(payload);
+  else if (action === "addWarehouseEntry") data = await handleAddWarehouseEntry(payload);
+  else if (action === "editWarehouseEntry") data = await handleEditWarehouseEntry(payload);
+  else if (action === "deleteWarehouseEntry") data = await handleDeleteWarehouseEntry(payload);
+  else if (action === "addDemand") data = await handleAddDemand(payload);
+  else if (action === "approveDemands") data = await handleApproveDemands(payload);
+  else if (action === "approveDemand") data = await handleApproveDemands({ items: [{ row: payload.row, approvedQty: payload.approvedQty, feedback: payload.feedback }] });
+  else if (action === "rejectDemands") data = await handleRejectDemands(payload);
+  else if (action === "rejectDemand") data = await handleRejectDemands({ rows: [payload.row] });
+  else if (action === "editDemand") data = await handleEditDemand(payload);
+  else if (action === "deleteDemand") data = await handleDeleteDemand(payload);
+  else if (action === "saveDemandFeedback") data = await handleSaveDemandFeedback(payload);
+  else if (action === "addPurchaseOrder") data = await handleAddPurchaseOrder(payload);
+  else if (action === "cancelPO") data = await handleCancelPO(payload);
+  else if (action === "clearPOBatch") data = await handleClearPOBatch(payload);
+  else if (action === "generatePOBatch") data = await handleGeneratePOBatch(payload);
+  else if (action === "autoTagVendors") data = await handleAutoTagVendors();
+  else if (action === "addManualPurchase") data = await handleAddManualPurchase(payload);
+  else if (action === "editManualPurchase") data = await handleEditManualPurchase(payload);
+  else if (action === "deleteManualPurchase") data = await handleDeleteManualPurchase(payload);
+  else if (action === "addVendor") data = await handleAddVendor(payload);
+  else if (action === "setProductVendor") data = await handleSetProductVendor(payload);
+  else if (action === "markAttendance") data = await handleMarkAttendance(payload);
+  else if (action === "editAttendancePunch") data = await handleEditAttendancePunch(payload);
+  else if (action === "addCylinderEntry") data = await handleAddCylinderEntry(payload);
+  else if (action === "updateCylinderPrice") { const price = Number(payload.price) || 0; if (price <= 0) throw new Error("Invalid price"); await setSetting("CylinderPrice", price); invalidate("cyl"); data = { price }; }
+  else if (action === "addStaff") data = await handleAddStaff(payload);
+  else if (action === "updateStaff") data = await handleUpdateStaff(payload);
+  else if (action === "deleteStaff") data = await handleDeleteStaff(payload);
+  // 🆕 AUTO-PO actions
+  else if (action === "runAutoPO") data = await runAutoPOForAll();
+  else if (action === "checkAutoPOForItem") data = await checkAndCreateAutoPO(payload.itemName);
+  else if (action === "uploadPhoto") {
+    const url = await uploadPhotoToDrive(payload.photoBase64, payload.userId || "photo", payload.name || "photo");
+    data = { url };
+  }
+  else data = { note: "Action not implemented yet: " + action };
+  return data;
+}
+
 // =================== ROUTER ===================
 app.all("/", async (req, res) => {
   const payload = { ...req.query, ...req.body };
   const action = payload.action;
   if (!action) return res.json({ ok: true, service: "Peetambra Bridge Running" });
   try {
+    // 🆕 Sirf write actions par _rid guard lagta hai (read actions par nahi)
+    const isRead = /^get/.test(action) || action === "poll" || action === "login" || action === "bootstrap";
+    const rid = (!isRead && payload._rid) ? (action + ":" + String(payload._rid)) : "";
+
     let data;
-    if (action === "login") data = await handleLogin(payload);
-    else if (action === "bootstrap") data = await handleBootstrap(payload);
-    else if (action === "poll") data = await buildPoll();
-    else if (action === "getProducts") data = await cached("products", readProducts);
-    else if (action === "getCategories") data = [...new Set((await cached("products", readProducts)).map(p => p.Category).filter(Boolean))].sort();
-    else if (action === "getStaff") data = await cached("staff", readStaff);
-    else if (action === "getVendors") data = await cached("vendors", readVendors);
-    else if (action === "getDemands") data = await cached("demands", readDemands);
-    else if (action === "getDashboardStats") data = await buildDashboardStats();
-    else if (action === "getLowStockAlerts") {
-      const products = await cached("products", readProducts);
-      // 🔧 FIX: Compare against Current Stock (pcs), not carton
-      data = products.filter(p => {
-        const min = num(p.Min), max = num(p.Max), cur = num(p["Current Stock"]);
-        return (min > 0 && cur <= min) || (max > 0 && cur >= max);
-      }).map(p => ({
-        "Item Name": p["Item Name (Standardized)"],
-        Category: p.Category,
-        Unit: p.Unit,
-        "Current Stock": p["Current Stock"],
-        "Min Stock": p.Min,
-        "Max Stock": p.Max,
-        "Status": (num(p.Min) > 0 && num(p["Current Stock"]) <= num(p.Min)) ? "LOW" : "OVERSTOCK"
-      }));
+    if (rid) {
+      let entry = ridStore.get(rid);
+      if (!entry) {
+        entry = { t: Date.now(), promise: dispatchAction(action, payload) };
+        ridStore.set(rid, entry);
+        // Fail hua to _rid hata do, taaki retry sach mein dobara try kare
+        entry.promise.catch(() => { if (ridStore.get(rid) === entry) ridStore.delete(rid); });
+      } else {
+        console.log("Duplicate request blocked:", action, payload._rid);
+      }
+      data = await entry.promise;
+    } else {
+      data = await dispatchAction(action, payload);
     }
-    else if (action === "getWarehouseEntries") data = await cached("whlog", readWarehouseEntries);
-    else if (action === "getCylinderEntries") data = await cached("cyl", readCylinderEntries);
-    else if (action === "getCylinderPrice") data = Number(await getSetting("CylinderPrice", "2900")) || 2900;
-    else if (action === "getPOBatches") data = await cached("po_batches", readPOBatches);
-    else if (action === "getPurchaseOrders") data = await cached("po", readPO);
-    else if (action === "getManualPurchases") data = await cached("mpo", readManualPurchases);
-    else if (action === "getAttendance") {
-      let att = await cached("attendance", readAttendance);
-      if (payload.userId) att = att.filter(r => String(r["User ID"]).toLowerCase().trim() === String(payload.userId).toLowerCase().trim());
-      data = att;
-    }
-    else if (action === "addProduct") data = await handleAddProduct(payload);
-    else if (action === "addWarehouseEntry") data = await handleAddWarehouseEntry(payload);
-    else if (action === "editWarehouseEntry") data = await handleEditWarehouseEntry(payload);
-    else if (action === "deleteWarehouseEntry") data = await handleDeleteWarehouseEntry(payload);
-    else if (action === "addDemand") data = await handleAddDemand(payload);
-    else if (action === "approveDemands") data = await handleApproveDemands(payload);
-    else if (action === "approveDemand") data = await handleApproveDemands({ items: [{ row: payload.row, approvedQty: payload.approvedQty, feedback: payload.feedback }] });
-    else if (action === "rejectDemands") data = await handleRejectDemands(payload);
-    else if (action === "rejectDemand") data = await handleRejectDemands({ rows: [payload.row] });
-    else if (action === "editDemand") data = await handleEditDemand(payload);
-    else if (action === "deleteDemand") data = await handleDeleteDemand(payload);
-    else if (action === "saveDemandFeedback") data = await handleSaveDemandFeedback(payload);
-    else if (action === "addPurchaseOrder") data = await handleAddPurchaseOrder(payload);
-    else if (action === "cancelPO") data = await handleCancelPO(payload);
-    else if (action === "clearPOBatch") data = await handleClearPOBatch(payload);
-    else if (action === "generatePOBatch") data = await handleGeneratePOBatch(payload);
-    else if (action === "autoTagVendors") data = await handleAutoTagVendors();
-    else if (action === "addManualPurchase") data = await handleAddManualPurchase(payload);
-    else if (action === "editManualPurchase") data = await handleEditManualPurchase(payload);
-    else if (action === "deleteManualPurchase") data = await handleDeleteManualPurchase(payload);
-    else if (action === "addVendor") data = await handleAddVendor(payload);
-    else if (action === "setProductVendor") data = await handleSetProductVendor(payload);
-    else if (action === "markAttendance") data = await handleMarkAttendance(payload);
-    else if (action === "editAttendancePunch") data = await handleEditAttendancePunch(payload);
-    else if (action === "addCylinderEntry") data = await handleAddCylinderEntry(payload);
-    else if (action === "updateCylinderPrice") { const price = Number(payload.price) || 0; if (price <= 0) throw new Error("Invalid price"); await setSetting("CylinderPrice", price); invalidate("cyl"); data = { price }; }
-    else if (action === "addStaff") data = await handleAddStaff(payload);
-    else if (action === "updateStaff") data = await handleUpdateStaff(payload);
-    else if (action === "deleteStaff") data = await handleDeleteStaff(payload);
-    // 🆕 AUTO-PO actions
-    else if (action === "runAutoPO") data = await runAutoPOForAll();
-    else if (action === "checkAutoPOForItem") data = await checkAndCreateAutoPO(payload.itemName);
-    else if (action === "uploadPhoto") {
-      const url = await uploadPhotoToDrive(payload.photoBase64, payload.userId || "photo", payload.name || "photo");
-      data = { url };
-    }
-    else data = { note: "Action not implemented yet: " + action };
     res.json({ ok: true, data });
   } catch (e) {
     console.error("Router error on", action, ":", e.message);
