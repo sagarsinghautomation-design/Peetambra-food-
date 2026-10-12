@@ -335,6 +335,49 @@ function matchVendorForItem(name) {
   return "";
 }
 
+// =================== 🆕 FIND OR CREATE PRODUCT ===================
+// Item Product & Stock Master mein mile to wahi return karta hai.
+// Na mile aur frontend ne mode "new" (ya newName) bheja ho to naya row bana deta hai.
+// Demand, Warehouse Entry aur Manual Purchase teeno isi ko use karte hain.
+async function findOrCreateProduct(p) {
+  const name = String(p.itemName || p.newName || p.name || "").trim();
+  if (!name) throw new Error("Item ka naam khali hai");
+  const findIn = (list) => list.find(x => normH(x["Item Name (Standardized)"]) === normH(name));
+
+  let products = await cached("products", readProducts);
+  let item = findIn(products);
+  if (item) return { item, created: false };
+
+  // cache purana ho sakta hai — sheet se ek baar fresh padh ke dobara check karo
+  invalidate("products");
+  products = await cached("products", readProducts);
+  item = findIn(products);
+  if (item) return { item, created: false };
+
+  const isNew = p.mode === "new" || !!p.newName;
+  if (!isNew) throw new Error("Item not found: " + name);
+
+  const category = String(p.newCategory || p.category || "").trim();
+  const unit = String(p.newUnit || p.unit || "").trim();
+  if (!category || !unit) throw new Error("Naye item ke liye Category aur Unit zaroori hai");
+  const packaging = p.newPackaging || p.packaging || "";
+  const stockType = /daily/i.test(String(p.stockType || "")) ? "Daily Market" : "Stocked";
+
+  // Column order = handleAddProduct jaisa (Product & Stock Master sheet)
+  await appendRow(S.PRODUCTS, [
+    products.length + 1, name, category, packaging, unit,
+    0, 0, 0, p.demandUnit || unit, 0, 0, "", "",
+    Number(p.newMinStock) || 0, Number(p.newMaxStock) || 0, "", "", unit, "",
+    p.baseUnit || unit, Number(p.stockUnitQty) || 1, stockType
+  ]);
+
+  invalidate("products", "dash");
+  products = await cached("products", readProducts); // fresh read => sahi _row milega
+  item = findIn(products);
+  if (!item) throw new Error("Naya item banaya par sheet se wapas nahi mila — dobara try karo");
+  return { item, created: true };
+}
+
 // =================== 🆕 AUTO-PO ENGINE ===================
 async function checkAndCreateAutoPO(itemName) {
   if (!itemName) return null;
@@ -478,18 +521,18 @@ async function buildDashboardStats() {
 
 // =================== DEMAND HANDLERS ===================
 async function handleAddDemand(p) {
-  const products = await cached("products", readProducts);
-  const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(p.itemName));
-  if (!item) throw new Error("Item not found: " + p.itemName);
+  // 🆕 Item mile to use karo, nahi to (mode "new" par) Product Master mein naya bana do
+  const { item } = await findOrCreateProduct(p);
+  const itemName = item["Item Name (Standardized)"];
   const id = "DMD-" + Date.now() + "-" + Math.floor(Math.random() * 90 + 10);
   const ts = toISTISO(new Date()); // 🆕 IST
-  const rowNum = await appendRow(S.DEMAND, [id, ts, p.raisedBy || "", p.itemName, p.category || item.Category || "", p.unit || item.Unit || "", Number(p.qty) || 0, "Pending", "", p.notes || "", "", "", "", ""]);
+  const rowNum = await appendRow(S.DEMAND, [id, ts, p.raisedBy || "", itemName, p.category || item.Category || "", p.unit || item.Unit || "", Number(p.qty) || 0, "Pending", "", p.notes || "", "", "", "", ""]);
   if (item._row) {
     const newDemand = num(item["Deman for canteen"]) + num(p.qty);
     await writeCell(S.PRODUCTS, item._row, 8, newDemand);
   }
   invalidate("demands", "products", "dash");
-  return { id, row: rowNum };
+  return { id, row: rowNum, itemName };
 }
 
 async function handleApproveDemands(p) {
@@ -722,9 +765,8 @@ async function handleEditAttendancePunch(p) {
 
 // =================== WAREHOUSE HANDLERS ===================
 async function handleAddWarehouseEntry(p) {
-  const products = await cached("products", readProducts);
-  const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(p.itemName || p.newName));
-  if (!item) throw new Error("Item not found");
+  // 🆕 Naya item ho to pehle Product Master mein bana do
+  const { item } = await findOrCreateProduct(p);
   const qty = Number(p.qty) || 0; if (qty <= 0) throw new Error("Invalid quantity");
   const newLoose = round3(num(item["W/H Opening Loose"]) + qty);
   await writeCell(S.PRODUCTS, item._row, 7, newLoose);
@@ -820,9 +862,8 @@ async function handleAutoTagVendors() {
 
 // =================== MANUAL PURCHASE HANDLERS ===================
 async function handleAddManualPurchase(p) {
-  const products = await cached("products", readProducts);
-  const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(p.itemName || p.newName));
-  if (!item) throw new Error("Item not found");
+  // 🆕 Naya item ho to pehle Product Master mein bana do
+  const { item } = await findOrCreateProduct(p);
   const qty = Number(p.qty) || 0; if (qty <= 0) throw new Error("Invalid quantity");
   const newPurchase = round3(num(item["Purchase Stock  QTy"]) + qty);
   await writeCell(S.PRODUCTS, item._row, 11, newPurchase);
