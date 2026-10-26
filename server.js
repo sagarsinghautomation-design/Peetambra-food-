@@ -737,12 +737,19 @@ async function handleBootstrap(p) {
 
 async function buildPoll() {
   const demands = await cached("demands", readDemands);
-  let pending = 0, newest = null;
-  demands.forEach(d => { if (d.Status === "Pending") { pending++; if (!newest || new Date(d.Timestamp) > new Date(newest.Timestamp)) newest = d; } });
   const products = await cached("products", readProducts).catch(() => []);
+  const dailyNames = new Set(products.filter(p => isDaily(p["Stock Type"])).map(p => normH(p["Item Name (Standardized)"])));
+  let pending = 0, newest = null, pendingStocked = 0, newestStocked = null;
+  demands.forEach(d => {
+    if (d.Status !== "Pending") return;
+    pending++; if (!newest || new Date(d.Timestamp) > new Date(newest.Timestamp)) newest = d;
+    if (!dailyNames.has(normH(d["Item Name"]))) { pendingStocked++; if (!newestStocked || new Date(d.Timestamp) > new Date(newestStocked.Timestamp)) newestStocked = d; }
+  });
+  const brief = (d) => d ? { item: d["Item Name"], qty: d["Qty Requested"], unit: d.Unit, by: d["Raised By"] } : null;
   const sig = demands.length + "|" + demands.slice(0, 300).map(d => d["Demand ID"] + d.Status + d["Qty Requested"] + d["Approved Qty"] + d.Feedback + d.Rate).join(",")
     + "|" + products.map(p => p["Item Name (Standardized)"] + p["Current Stock"] + p.Rate).join(",");
-  return { ver: DATA_VER + "-" + hashStr(sig), pending, newest: newest ? { item: newest["Item Name"], qty: newest["Qty Requested"], unit: newest.Unit, by: newest["Raised By"] } : null };
+  // pendingStocked/newestStocked = Supervisor ke liye (Daily Market wali demand Supervisor ko nahi dikhti)
+  return { ver: DATA_VER + "-" + hashStr(sig), pending, newest: brief(newest), pendingStocked, newestStocked: brief(newestStocked) };
 }
 
 async function buildDashboardStats() {
