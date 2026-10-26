@@ -22,7 +22,7 @@ const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL || "";
 const S = {
   PRODUCTS: "Product & Stock Master", ATTENDANCE: "Attendance", DEMAND: "Demand",
   PO: "Purchase Orders", STAFF: "Staff", WHLOG: "Warehouse Entry Log",
-  CYLINDER: "Cylinder Entry", SETTINGS: "Settings", RATEHIST: "Rate History",
+  CYLINDER: "Cylinder Entry", SETTINGS: "Settings", RATEHIST: "Rate History", MSG: "Messages", COMPLAINT: "Complaints",
 };
 
 // =================== HELPERS ===================
@@ -226,7 +226,7 @@ async function readRowByHeaders(sheetName, row, wanted, aliases) {
 }
 
 // =================== CACHE ===================
-const TTL = { demands: 15, attendance: 20, products: 20, po: 20, po_batches: 20, mpo: 20, whlog: 20, cyl: 20, staff: 60, vendors: 60, settings: 60, ratehist: 60 };
+const TTL = { complaints: 10, messages: 10, complaints: 10, demands: 15, attendance: 20, products: 20, po: 20, po_batches: 20, mpo: 20, whlog: 20, cyl: 20, staff: 60, vendors: 60, settings: 60, ratehist: 60 };
 let DATA_VER = 1; // har write par badhta hai — frontend isse turant refresh karta hai
 async function cached(key, builder) {
   const hit = cache.get(key); if (hit !== undefined) return hit;
@@ -524,17 +524,28 @@ async function mutateProduct(ref, fn) {
 // Har item ke 2 hi unit allowed hain: "Unit" (chhota, jaise pcs) aur "Base Unit" (bada, jaise pkt/box/vori).
 // Sheet ke saare totals (Opening Loose, Demand, Approved, Purchase) hamesha "Unit" mein rakhe jaate hain,
 // isliye Base Unit mein di gayi qty ko × "1 Stock Unit = (Base Qty)" karke likha jata hai.
+// Standard units: gm↔kg aur ml↔ltr apne aap convert (jaise 250 gm pudina = 0.25 kg)
+const STD_UNIT = { g: ["mass", 1], gm: ["mass", 1], gms: ["mass", 1], gram: ["mass", 1], grams: ["mass", 1], kg: ["mass", 1000], kgs: ["mass", 1000], kilo: ["mass", 1000],
+  ml: ["vol", 1], l: ["vol", 1000], ltr: ["vol", 1000], litre: ["vol", 1000], liter: ["vol", 1000] };
+function stdOf(u) { return STD_UNIT[normH(u).replace(/\./g, "")] || null; }
+function stdSibling(u) { const s = stdOf(u); if (!s) return ""; return s[0] === "mass" ? (s[1] === 1 ? "kg" : "gm") : (s[1] === 1 ? "ltr" : "ml"); }
 function allowedUnits(item) {
   const s = [];
-  [item.Unit, item["Base Unit"]].forEach(u => { u = String(u || "").trim(); if (u && !s.some(x => normH(x) === normH(u))) s.push(u); });
+  [item.Unit, item["Base Unit"], stdSibling(item.Unit)].forEach(u => { u = String(u || "").trim(); if (u && !s.some(x => normH(x) === normH(u) || (stdOf(x) && stdOf(u) && stdOf(x)[0] === stdOf(u)[0] && stdOf(x)[1] === stdOf(u)[1]))) s.push(u); });
   return s;
 }
-function toNative(item, qty, unit) {
+// Kisi bhi unit ki qty ko item ke "Unit" mein badlo
+function unitFactor(item, unit) {
+  const u = normH(unit || item.Unit), nat = normH(item.Unit), base = normH(item["Base Unit"]);
   const suq = num(item["1 Stock Unit = (Base Qty)"]) || 1;
-  const u = normH(unit || item.Unit);
-  if (u && u === normH(item["Base Unit"]) && u !== normH(item.Unit)) return round3(qty * suq);
-  return round3(qty);
+  if (!u || u === nat) return 1;
+  if (u === base && base !== nat) return suq;
+  const su = stdOf(u), sn = stdOf(nat), sb = stdOf(base);
+  if (su && sn && su[0] === sn[0]) return su[1] / sn[1];
+  if (su && sb && su[0] === sb[0] && base !== nat) return (su[1] / sb[1]) * suq;
+  return 1;
 }
+function toNative(item, qty, unit) { return round3(qty * unitFactor(item, unit)); }
 function checkUnit(item, unit, role) {
   const allowed = allowedUnits(item);
   if (!unit) return item.Unit;
@@ -584,12 +595,12 @@ const PO_ALIAS = { "PO ID": /^po\s*id$/i };
 async function readWarehouseEntries() {
   const objs = rowsToObjects(await readRange(S.WHLOG, "A1:ZZ", "FORMATTED_VALUE"));
   objs.forEach(o => { o["Timestamp"] = normalizeDateTime(o["Timestamp"]); o["Expiry Date"] = normalizeDate(o["Expiry Date"]); o["Last Edited"] = normalizeDateTime(o["Last Edited"]); o["Rate"] = money(o["Rate"]); });
-  return objs.filter(o => o["Item Name"]).slice(-300).reverse();
+  return objs.filter(o => o["Item Name"]).slice(-3000).reverse();
 }
 async function readCylinderEntries() {
   const objs = rowsToObjects(await readRange(S.CYLINDER, "A1:ZZ", "FORMATTED_VALUE"));
   objs.forEach(o => { o["Timestamp"] = normalizeDateTime(o["Timestamp"]); });
-  return objs.slice(-200).reverse();
+  return objs.filter(o => o["Timestamp"]).slice(-3000).reverse();
 }
 async function readPO() {
   const objs = rowsToObjects(await readRange(S.PO, "A1:ZZ", "FORMATTED_VALUE"));
@@ -598,7 +609,7 @@ async function readPO() {
 }
 async function readManualPurchases() {
   const objs = await readPO();
-  return objs.filter(r => String(r["PO ID"]).indexOf("MPO-") === 0).slice(-400).reverse();
+  return objs.filter(r => String(r["PO ID"]).indexOf("MPO-") === 0).slice(-3000).reverse();
 }
 async function readAttendance() {
   const rows = await readRange(S.ATTENDANCE, "A1:R", "FORMATTED_VALUE");
@@ -717,7 +728,7 @@ async function handleLogin(p) {
 
 async function handleBootstrap(p) {
   const want = p.want || [];
-  const out = { products: [], demands: [], staff: [], myAttendance: [], allAttendance: [], vendors: [], stats: null, poll: null };
+  const out = { poll: null }; // sirf maangi hui lists bhejo — khali [] bhejne se app galat cache kar leta tha
   const tasks = [];
   if (want.includes("products")) tasks.push(cached("products", readProducts).then(d => out.products = d).catch(() => {}));
   if (want.includes("demands")) tasks.push(cached("demands", readDemands).then(d => out.demands = d).catch(() => {}));
@@ -1415,6 +1426,120 @@ async function readPOBatches() {
   return list.sort((a, b) => (order[a.status] - order[b.status]));
 }
 
+// =================== 🆕 MESSAGES (Admin → Staff, staff ko reply karna zaroori) ===================
+// "Messages" sheet apne aap banti hai: har recipient ki ek row.
+const MSG_HDR = ["Msg ID", "Timestamp", "From", "From ID", "To ID", "To Name", "Message", "Status", "Reply", "Replied At", "Seen At"];
+const MSG_SENDERS = ["Admin", "Hero", "SuperAdmin"];
+async function appendRows(sheetName, rows) {
+  if (!rows.length) return;
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID, range: `'${sheetName}'!A1`, valueInputOption: "RAW", insertDataOption: "INSERT_ROWS",
+    requestBody: { values: rows },
+  });
+}
+async function readMessages() {
+  const m = await sheetMeta();
+  if (!m[S.MSG]) return [];
+  const objs = rowsToObjects(await readRange(S.MSG, "A1:K", "FORMATTED_VALUE"));
+  objs.forEach(o => { o.Timestamp = normalizeDateTime(o.Timestamp); o["Replied At"] = normalizeDateTime(o["Replied At"]); o["Seen At"] = normalizeDateTime(o["Seen At"]); o.Status = o.Status || "Pending"; });
+  return objs.filter(o => o["Msg ID"]).reverse();
+}
+async function handleSendMessage(p) {
+  await requireRole(p, MSG_SENDERS, "Message bhejna");
+  const me = await staffOf(p);
+  const text = String(p.message || "").trim().slice(0, 1000);
+  if (!text) throw new Error("Message khali hai");
+  const staff = await cached("staff", readStaff);
+  let to = Array.isArray(p.to) ? p.to.map(x => String(x).toLowerCase().trim()) : [];
+  const list = staff.filter(s => String(s.User || "").trim() && String(s.User).toLowerCase().trim() !== String(me.User).toLowerCase().trim() && (p.toAll || to.includes(String(s.User).toLowerCase().trim())));
+  if (!list.length) throw new Error("Kam se kam ek staff chuno");
+  await ensureSheet(S.MSG, MSG_HDR);
+  const ts = toISTISO(new Date());
+  const base = "MSG-" + Date.now();
+  await appendRows(S.MSG, list.map((s, i) => [base + "-" + i, ts, me.Name, me.User, s.User, s.Name, text, "Pending", "", "", ""]));
+  invalidate("messages");
+  return { sent: list.length, to: list.map(s => s.Name) };
+}
+async function handleGetMessages(p) {
+  const role = await roleOf(p);
+  const all = await cached("messages", readMessages);
+  if (MSG_SENDERS.includes(role) && !p.mine) return all.slice(0, 1000);
+  const uid = String(p._uid || p.userId || "").toLowerCase().trim();
+  if (!uid) return [];
+  return all.filter(m => String(m["To ID"] || "").toLowerCase().trim() === uid).slice(0, 200);
+}
+async function msgRowFor(p) {
+  const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid message");
+  const r = (await readRange(S.MSG, `A${row}:K${row}`, "FORMATTED_VALUE"))[0] || [];
+  const uid = String(p._uid || "").toLowerCase().trim();
+  if (!uid || String(r[4] || "").toLowerCase().trim() !== uid) throw new Error("Ye message aapke liye nahi hai");
+  return { row, r };
+}
+async function handleReplyMessage(p) {
+  const reply = String(p.reply || "").trim().slice(0, 1000);
+  if (!reply) throw new Error("Reply likho");
+  const { row, r } = await msgRowFor(p);
+  const now = toISTISO(new Date());
+  await batchWrite(S.MSG, [{ row, col: 8, value: "Replied" }, { row, col: 9, value: reply }, { row, col: 10, value: now }].concat(r[10] ? [] : [{ row, col: 11, value: now }]));
+  invalidate("messages");
+  return { row, reply, repliedAt: now };
+}
+async function handleMarkMessageSeen(p) {
+  const { row, r } = await msgRowFor(p);
+  if (!r[10]) { await batchWrite(S.MSG, [{ row, col: 11, value: toISTISO(new Date()) }]); cache.del("messages"); }
+  return { row };
+}
+
+// =================== 🆕 COMPLAINTS (Staff → Admin/Hero). Staff sirf apne dekh sakta hai ===================
+const COMPLAINT_HDR = ["Ticket ID", "Timestamp", "From", "From ID", "Role", "Type", "Message", "Status", "Admin Reply", "Resolved By", "Resolved At"];
+const COMPLAINT_VIEWERS = ["Admin", "Hero"];
+const COMPLAINT_TYPES = ["Shikayat", "Request", "Sujhav", "Maal / Stock", "Attendance", "Aur kuch"];
+async function readComplaints() {
+  const m = await sheetMeta();
+  if (!m[S.COMPLAINT]) return [];
+  const objs = rowsToObjects(await readRange(S.COMPLAINT, "A1:K", "FORMATTED_VALUE"));
+  objs.forEach(o => { o.Timestamp = normalizeDateTime(o.Timestamp); o["Resolved At"] = normalizeDateTime(o["Resolved At"]); o.Status = o.Status || "Open"; });
+  return objs.filter(o => o["Ticket ID"]).reverse();
+}
+async function handleSendComplaint(p) {
+  const me = await staffOf(p);
+  if (!me) throw new Error("Pehle login karo");
+  const text = String(p.message || "").trim().slice(0, 1500);
+  if (!text) throw new Error("Message likho");
+  const type = COMPLAINT_TYPES.includes(p.type) ? p.type : "Aur kuch";
+  await ensureSheet(S.COMPLAINT, COMPLAINT_HDR);
+  const id = "TKT-" + Date.now();
+  const row = await appendRow(S.COMPLAINT, [id, toISTISO(new Date()), me.Name, me.User, me.Permission, type, text, "Open", "", "", ""]);
+  invalidate("complaints");
+  return { id, row };
+}
+async function handleGetComplaints(p) {
+  const role = await roleOf(p);
+  const all = await cached("complaints", readComplaints);
+  if (COMPLAINT_VIEWERS.includes(role)) return all.slice(0, 1500);
+  const uid = String(p._uid || "").toLowerCase().trim();
+  if (!uid) return [];
+  // dusre staff ke messages kabhi nahi
+  return all.filter(c => String(c["From ID"] || "").toLowerCase().trim() === uid).slice(0, 300);
+}
+async function handleUpdateComplaint(p) {
+  await requireRole(p, COMPLAINT_VIEWERS, "Complaint resolve");
+  const me = await staffOf(p);
+  const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid complaint");
+  const r = (await readRange(S.COMPLAINT, `A${row}:K${row}`, "FORMATTED_VALUE"))[0] || [];
+  if (!r[0]) throw new Error("Complaint nahi mili");
+  const reply = String(p.reply === undefined ? "" : p.reply).trim().slice(0, 1500);
+  const now = toISTISO(new Date());
+  const cells = [];
+  if (reply) cells.push({ row, col: 9, value: reply });
+  if (p.status === "Resolved") cells.push({ row, col: 8, value: "Resolved" }, { row, col: 10, value: me.Name }, { row, col: 11, value: now });
+  else if (p.status === "Open") cells.push({ row, col: 8, value: "Open" }, { row, col: 10, value: "" }, { row, col: 11, value: "" });
+  if (!cells.length) throw new Error("Kuch badla nahi");
+  await batchWrite(S.COMPLAINT, cells);
+  invalidate("complaints");
+  return { row, status: p.status || r[7], reply };
+}
+
 // =================== ACTION DISPATCHER ===================
 async function dispatchAction(action, payload) {
   let data;
@@ -1428,6 +1553,13 @@ async function dispatchAction(action, payload) {
   else if (action === "getDemands") data = await cached("demands", readDemands);
   else if (action === "getDashboardStats") data = await buildDashboardStats();
   else if (action === "getRateHistory") data = await cached("ratehist", readRateHistory);
+  else if (action === "getMessages") data = await handleGetMessages(payload);
+  else if (action === "getComplaints") data = await handleGetComplaints(payload);
+  else if (action === "sendComplaint") data = await handleSendComplaint(payload);
+  else if (action === "updateComplaint") data = await handleUpdateComplaint(payload);
+  else if (action === "sendMessage") data = await handleSendMessage(payload);
+  else if (action === "replyMessage") data = await handleReplyMessage(payload);
+  else if (action === "markMessageSeen") data = await handleMarkMessageSeen(payload);
   else if (action === "getLowStockAlerts") {
     const products = await cached("products", readProducts);
     data = products.filter(p => {
