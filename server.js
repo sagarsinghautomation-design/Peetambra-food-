@@ -8,7 +8,8 @@ app.use(cors());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ limit: "20mb", type: ["application/json", "text/plain"] }));
 
-const cache = new NodeCache({ stdTTL: 120, checkperiod: 30 });
+// useClones:false — cache se data turant milta hai (copy banane ka time bachta hai)
+const cache = new NodeCache({ stdTTL: 120, checkperiod: 30, useClones: false });
 
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT),
@@ -21,22 +22,39 @@ const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL || "";
 const S = {
   PRODUCTS: "Product & Stock Master", ATTENDANCE: "Attendance", DEMAND: "Demand",
   PO: "Purchase Orders", STAFF: "Staff", WHLOG: "Warehouse Entry Log",
-  CYLINDER: "Cylinder Entry", SETTINGS: "Settings",
+  CYLINDER: "Cylinder Entry", SETTINGS: "Settings", RATEHIST: "Rate History",
 };
 
 // =================== HELPERS ===================
-function num(v) { const n = Number(v); return isNaN(n) ? 0 : n; }
+// num(): "₹1,246" / "1,200" / " 45 " sab ko sahi number banata hai; "NA"/khali → 0
+function num(v) {
+  if (v === null || v === undefined || v === "") return 0;
+  if (typeof v === "number") return isNaN(v) ? 0 : v;
+  const n = Number(String(v).replace(/[₹,\s]/g, ""));
+  return isNaN(n) ? 0 : n;
+}
+// money(): rate ke liye — "NA"/khali → "" (blank), warna number
+function money(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "number") return isNaN(v) ? "" : v;
+  const s = String(v).replace(/[₹,\s]/g, "");
+  if (!s) return "";
+  const n = Number(s);
+  return isNaN(n) ? "" : n;
+}
 function round3(v) { return Math.round(v * 1000) / 1000; }
-function normH(s) { return String(s).toLowerCase().replace(/\s+/g, " ").trim(); }
+function round2(v) { return Math.round(v * 100) / 100; }
+function normH(s) { return String(s === undefined || s === null ? "" : s).toLowerCase().replace(/\s+/g, " ").trim(); }
 function pad2(n) { return String(n).padStart(2, "0"); }
-function toISODate(d) { return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
+function toISODate(d) { return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()); }
+function isDaily(v) { return /daily/i.test(String(v || "")); }
 
-// 🆕 IST helpers — Indian Standard Time = UTC + 5:30
+// IST helpers — Indian Standard Time = UTC + 5:30
 function toISTISO(d) {
   const dt = (d instanceof Date) ? d : new Date(d);
   if (isNaN(dt.getTime())) return "";
   const ist = new Date(dt.getTime() + 5.5 * 3600000);
-  return ist.toISOString().slice(0, 19); // "2026-10-09T17:30:00" (IST wall-clock)
+  return ist.toISOString().slice(0, 19);
 }
 
 function normalizeDate(v) {
@@ -49,8 +67,9 @@ function normalizeDate(v) {
   const n = Number(s);
   if (!isNaN(n) && n > 20000 && n < 60000) {
     const d = new Date(Date.UTC(1899, 11, 30) + n * 86400000);
-    return toISODate(d);
+    return d.getUTCFullYear() + "-" + pad2(d.getUTCMonth() + 1) + "-" + pad2(d.getUTCDate());
   }
+  if (!isNaN(n)) return "";
   const d = new Date(s);
   if (!isNaN(d.getTime())) return toISODate(d);
   return "";
@@ -60,14 +79,10 @@ function normalizeDateTime(v, dateHint) {
   if (v === null || v === undefined || v === "") return "";
   if (v instanceof Date) return toISTISO(v);
   const s = String(v).trim(); if (!s) return "";
-
-  // 🆕 ISO with Z suffix (UTC) → convert to IST
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/i.test(s)) {
     const d = new Date(s);
     if (!isNaN(d.getTime())) return toISTISO(d);
   }
-
-  // ISO without Z (naive IST) → keep as-is
   if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return s.slice(0, 19);
   if (/^\d{4}-\d{2}-\d{2}/.test(s)) { const d = new Date(s); if (!isNaN(d.getTime())) return d.toISOString().slice(0, 19); }
   const n = Number(s);
@@ -110,6 +125,19 @@ async function writeCell(sheetName, row, col, value) {
   });
 }
 
+// 🆕 Ek hi API call mein kai cells likhna — sequential writeCell se 5-10x tez
+async function batchWrite(sheetName, cells) {
+  const list = (cells || []).filter(c => c && c.row && c.col);
+  if (!list.length) return;
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId: SHEET_ID,
+    requestBody: {
+      valueInputOption: "USER_ENTERED",
+      data: list.map(c => ({ range: `'${sheetName}'!${colLetter(c.col)}${c.row}`, values: [[c.value === undefined || c.value === null ? "" : c.value]] })),
+    },
+  });
+}
+
 async function appendRow(sheetName, values) {
   const resp = await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID, range: `'${sheetName}'!A1`,
@@ -131,8 +159,74 @@ function rowsToObjects(rows) {
   });
 }
 
-// 🆕 Chhota TTL — sheet mein seedha kiya gaya edit bhi 15-20 sec mein app mein aa jata hai
-const TTL = { demands: 15, attendance: 20, products: 20, po: 20, po_batches: 20, mpo: 20, whlog: 20, cyl: 20, staff: 60, vendors: 60, settings: 60 };
+// =================== SHEET META / HEADERS ===================
+let META = null;
+async function sheetMeta(force) {
+  if (META && !force) return META;
+  const r = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID, fields: "sheets.properties(sheetId,title,gridProperties)" });
+  META = {};
+  (r.data.sheets || []).forEach(s => {
+    META[s.properties.title] = { sheetId: s.properties.sheetId, cols: (s.properties.gridProperties || {}).columnCount || 26 };
+  });
+  return META;
+}
+async function ensureSheet(name, headers) {
+  const m = await sheetMeta();
+  if (m[name]) return;
+  await sheets.spreadsheets.batchUpdate({ spreadsheetId: SHEET_ID, requestBody: { requests: [{ addSheet: { properties: { title: name } } }] } });
+  await sheetMeta(true);
+  if (headers && headers.length) await batchWrite(name, headers.map((h, i) => ({ row: 1, col: i + 1, value: h })));
+}
+async function ensureCols(name, n) {
+  const m = await sheetMeta();
+  const s = m[name];
+  if (!s || s.cols >= n) return;
+  await sheets.spreadsheets.batchUpdate({ spreadsheetId: SHEET_ID, requestBody: { requests: [{ appendDimension: { sheetId: s.sheetId, dimension: "COLUMNS", length: n - s.cols } }] } });
+  s.cols = n;
+}
+// Header naam se column dhoondhta hai; na mile to sheet ke end mein header bana deta hai.
+// Isse kisi bhi sheet mein column aage-peeche ho jaye to bhi sahi column mein hi likha jayega.
+const HDR_CACHE = {};
+async function ensureHeaders(sheetName, wanted, aliases) {
+  aliases = aliases || {};
+  let hdr = HDR_CACHE[sheetName];
+  if (!hdr) hdr = ((await readRange(sheetName, "1:1", "FORMATTED_VALUE"))[0] || []).map(h => String(h).trim());
+  const map = {}, add = [];
+  wanted.forEach(w => {
+    let idx = hdr.findIndex(h => normH(h) === normH(w));
+    if (idx < 0 && aliases[w]) idx = hdr.findIndex(h => aliases[w].test(h));
+    if (idx < 0) { const j = add.indexOf(w); idx = j >= 0 ? hdr.length + j : hdr.length + add.push(w) - 1; }
+    map[w] = idx + 1;
+  });
+  if (add.length) {
+    await ensureCols(sheetName, hdr.length + add.length);
+    await batchWrite(sheetName, add.map((w, i) => ({ row: 1, col: hdr.length + i + 1, value: w })));
+    hdr = hdr.concat(add);
+  }
+  HDR_CACHE[sheetName] = hdr;
+  return map;
+}
+async function appendByHeaders(sheetName, obj, aliases) {
+  const map = await ensureHeaders(sheetName, Object.keys(obj), aliases);
+  const len = Math.max(...Object.values(map));
+  const arr = new Array(len).fill("");
+  Object.keys(obj).forEach(k => { arr[map[k] - 1] = obj[k] === undefined || obj[k] === null ? "" : obj[k]; });
+  return appendRow(sheetName, arr);
+}
+async function writeByHeaders(sheetName, row, obj, aliases) {
+  const map = await ensureHeaders(sheetName, Object.keys(obj), aliases);
+  await batchWrite(sheetName, Object.keys(obj).map(k => ({ row, col: map[k], value: obj[k] })));
+}
+async function readRowByHeaders(sheetName, row, wanted, aliases) {
+  const map = await ensureHeaders(sheetName, wanted, aliases);
+  const r = (await readRange(sheetName, `A${row}:ZZ${row}`, "UNFORMATTED_VALUE"))[0] || [];
+  const o = {};
+  wanted.forEach(k => { o[k] = r[map[k] - 1]; });
+  return o;
+}
+
+// =================== CACHE ===================
+const TTL = { demands: 15, attendance: 20, products: 20, po: 20, po_batches: 20, mpo: 20, whlog: 20, cyl: 20, staff: 60, vendors: 60, settings: 60, ratehist: 60 };
 let DATA_VER = 1; // har write par badhta hai — frontend isse turant refresh karta hai
 async function cached(key, builder) {
   const hit = cache.get(key); if (hit !== undefined) return hit;
@@ -140,7 +234,6 @@ async function cached(key, builder) {
 }
 function invalidate(...keys) { DATA_VER++; keys.forEach(k => cache.del(k)); }
 function hashStr(str) { let h = 0; for (let i = 0; i < str.length; i++) { h = (h * 31 + str.charCodeAt(i)) | 0; } return (h >>> 0).toString(36); }
-// Sheet ki IST "naive" time string ("2026-10-19T16:43:00") ko sahi ms mein badalta hai
 function parseIST(v) {
   const s = String(v || "").trim(); if (!s) return NaN;
   if (/Z$|[+-]\d{2}:\d{2}$/.test(s)) return Date.parse(s);
@@ -148,25 +241,32 @@ function parseIST(v) {
   return Date.parse(s);
 }
 const DEMAND_EDIT_WINDOW_MS = 60 * 60 * 1000;          // edit/delete: 1 ghanta
-const DEMAND_FEEDBACK_WINDOW_MS = 3 * 24 * 3600 * 1000; // feedback: 3 din (approve ke baad)
-const GRACE_MS = 2 * 60 * 1000;                          // phone/server clock ka thoda farq
+const DEMAND_FEEDBACK_WINDOW_MS = 3 * 24 * 3600 * 1000; // feedback: 3 din
+const ENTRY_EDIT_WINDOW_MS = 60 * 60 * 1000;           // warehouse/purchase entry edit: 1 ghanta
+const GRACE_MS = 2 * 60 * 1000;
 
-// =================== 🆕 DUPLICATE-REQUEST GUARD (_rid) ===================
-// Frontend har write request ke saath ek unique "_rid" bhejta hai. Network slow hone par
-// frontend wahi request dobara bhejta hai (same _rid). Yahan us _rid ko 10 minute yaad
-// rakhte hain: pehli request chal rahi ho ya ho chuki ho to dobara aane par wahi result
-// wapas bhej dete hain — naya save NAHI hota. Agar pehli request fail hui thi to _rid
-// hata dete hain, taaki retry sach mein dobara try ho sake.
+// =================== 🆕 LOCK — ek saath do request ek hi item ko na bigaadein ===================
+// Product Master ke saare read→calculate→write isi lock mein chalte hain, isliye do log ek saath
+// approve/entry karein to bhi stock ka hisaab kabhi galat nahi hota.
+const LOCKS = new Map();
+function withLock(key, fn) {
+  const prev = LOCKS.get(key) || Promise.resolve();
+  const run = prev.then(() => fn(), () => fn());
+  const tail = run.then(() => {}, () => {});
+  LOCKS.set(key, tail);
+  tail.then(() => { if (LOCKS.get(key) === tail) LOCKS.delete(key); });
+  return run;
+}
+
+// =================== DUPLICATE-REQUEST GUARD (_rid) ===================
 const RID_TTL_MS = 10 * 60 * 1000;
-const ridStore = new Map(); // key -> { t, promise }
+const ridStore = new Map();
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of ridStore) if (now - v.t > RID_TTL_MS) ridStore.delete(k);
 }, 60 * 1000).unref();
 
-// =================== 🆕 PHOTO UPLOAD (Apps Script → Google Drive) ===================
-// Photo Google Drive mein Apps Script ke through save hoti hai. Agar upload fail ho
-// to error Render Logs mein dikhega (pehle silently chhup jata tha).
+// =================== PHOTO UPLOAD (Apps Script → Google Drive) ===================
 async function uploadPhotoToDrive(photoBase64, userId, name) {
   if (!photoBase64) return "";
   if (!APPS_SCRIPT_URL) { console.error("Photo upload skipped: APPS_SCRIPT_URL env variable set nahi hai"); return ""; }
@@ -191,7 +291,7 @@ async function uploadPhotoToDrive(photoBase64, userId, name) {
   } finally { clearTimeout(timer); }
 }
 
-// =================== 🆕 SHIFT STATUS (On Time / Late / Early Leave / Overtime) ===================
+// =================== SHIFT STATUS ===================
 function parseClock(str) {
   const m = String(str).match(/(\d+):(\d+)\s*(AM|PM)/i);
   if (!m) return null;
@@ -217,7 +317,8 @@ function computeOutStatusAt(shift, minutes) {
     let end = parseClock((parts[1] || "").trim());
     if (start === null || end === null) return "Marked";
     let n = minutes;
-    if (end <= start) { end += 1440; if (n < start) n += 1440; } // overnight shift (jaise 6 PM - 2 AM)
+    if (end <= start) end += 1440;      // raat wali shift (jaise 6 PM - 2 AM)
+    if (n < start) n += 1440;           // shift shuru hone se pehle ka OUT = aadhi raat ke baad (agla din)
     if (n < end - 60) return "Early Leave";
     if (n > end + 30) return "Overtime";
     return "On Time";
@@ -230,80 +331,269 @@ function hmToMinutes(hm) {
   return m ? Number(m[1]) * 60 + Number(m[2]) : null;
 }
 
+// =================== ROLES ===================
+async function staffOf(p) {
+  const uid = String(p._uid || "").toLowerCase().trim();
+  if (!uid) return null;
+  const staff = await cached("staff", readStaff);
+  return staff.find(r => String(r.User || "").toLowerCase().trim() === uid) || null;
+}
+async function roleOf(p) { const s = await staffOf(p); return s ? String(s.Permission || "").trim() : ""; }
+async function requireRole(p, roles, what) {
+  const r = await roleOf(p);
+  if (!roles.includes(r)) throw new Error((what || "Ye kaam") + " sirf " + roles.join(" / ") + " kar sakta hai.");
+  return r;
+}
+
+// =================== PRODUCT MASTER — COLUMN MAP (header se) ===================
+// Sheet A:X — S no | Item Names | Category | Packaging | Unit | W/H Opening Full Pack | W/H Opening Loose |
+// Deman for canteen QTY | Demand Unit | Approved Demand Qty by supervisor | Approved QTY (Unit) |
+// Purchase Stock QTy | Purchase Stock QTy (Unit) | Current Stock In Carton (FORMULA) | Current Stock in pcs (FORMULA) |
+// Min | Max | Vendor | Rate | Unit of rate | Expiry Date | Base Unit | 1 Stock Unit = (Base Qty) | Stock Type
+// Column ki position header ke naam se nikalti hai — aage koi column badhe to bhi galat column mein nahi likhega.
+let PCOL = null;
+function buildProdCols(hdrRow) {
+  const H = (hdrRow || []).map(normH);
+  const used = new Set();
+  const find = (pred, def) => {
+    for (let i = 0; i < H.length; i++) if (H[i] && !used.has(i) && pred(H[i])) { used.add(i); return i; }
+    return def;
+  };
+  const C = {};
+  // specific pehle, general baad mein (order zaroori hai)
+  C.CURCARTON = find(x => x.includes("current stock") && x.includes("carton"), 13);
+  C.CURPCS = find(x => x.includes("current stock"), 14);
+  C.APPROVEDUNIT = find(x => x.includes("approved") && x.includes("(unit)"), 10);
+  C.PURCHASEUNIT = find(x => x.includes("purchase") && x.includes("(unit)"), 12);
+  C.APPROVED = find(x => x.includes("approved"), 9);
+  C.PURCHASE = find(x => x.includes("purchase"), 11);
+  C.DEMANDUNIT = find(x => x.startsWith("demand unit"), 8);
+  C.DEMAND = find(x => x.startsWith("deman"), 7);
+  C.RATEUNIT = find(x => x.startsWith("unit of rate"), 19);
+  C.RATE = find(x => x === "rate" || x.startsWith("rate "), 18);
+  C.SUQ = find(x => x.startsWith("1 stock unit") || x.includes("base qty"), 22);
+  C.BASEUNIT = find(x => x.startsWith("base unit"), 21);
+  C.STOCKTYPE = find(x => x.startsWith("stock type"), 23);
+  C.UNIT = find(x => x === "unit", 4);
+  C.NAME = find(x => x.startsWith("item name"), 1);
+  C.SNO = find(x => /^s\.?\s*no\b/.test(x), 0);
+  C.CAT = find(x => x.startsWith("category"), 2);
+  C.PACK = find(x => x.startsWith("packaging"), 3);
+  C.OPENFULL = find(x => x.includes("full pack"), 5);
+  C.OPENLOOSE = find(x => x.includes("loose"), 6);
+  C.MIN = find(x => x === "min" || x.startsWith("min "), 15);
+  C.MAX = find(x => x === "max" || x.startsWith("max "), 16);
+  C.VENDOR = find(x => x.startsWith("vendor"), 17);
+  C.EXPIRY = find(x => x.startsWith("expiry"), 20);
+  return C;
+}
+// 117 pcs, 1 pkt = 20 → "5 pkt + 17 pcs" (sheet mein N column "5.17")
+function packText(cur, suq, unit, baseUnit) {
+  if (suq <= 1 || normH(unit) === normH(baseUnit)) return `${cur} ${unit}`;
+  const neg = cur < 0, a = Math.abs(cur), full = Math.floor(a / suq + 1e-9), loose = round3(a - full * suq);
+  return `${neg ? "-" : ""}${full} ${baseUnit} + ${loose} ${unit}`;
+}
+function nb(v) { return (v === "" || v === undefined || v === null) ? "" : num(v); }
+
+// Ek row se product object — Current Stock hamesha yahin calculate hota hai:
+// Current (Unit/pcs) = Full Pack × (1 Base = qty) + Loose + Purchase − Approved   (Daily Market: Approved minus nahi hota)
+function rowToProduct(r, rowNum, C) {
+  const g = (i) => (r && i !== undefined && i >= 0) ? r[i] : undefined;
+  const name = String(g(C.NAME) === undefined ? "" : g(C.NAME)).trim();
+  if (!name) return null;
+  const unit = String(g(C.UNIT) || "").trim();
+  const baseUnit = String(g(C.BASEUNIT) || "").trim() || unit;
+  const suq = num(g(C.SUQ)) || 1;
+  const openFull = num(g(C.OPENFULL)), openLoose = num(g(C.OPENLOOSE));
+  const purchase = num(g(C.PURCHASE)), approved = num(g(C.APPROVED));
+  const stockType = String(g(C.STOCKTYPE) || "").trim() || "Stocked";
+  const daily = isDaily(stockType);
+  const opening = round3(openFull * suq + openLoose);
+  const cur = round3(opening + purchase - (daily ? 0 : approved));
+  return {
+    _row: rowNum, "S no": g(C.SNO) === undefined ? "" : g(C.SNO),
+    "Item Name (Standardized)": name,
+    Category: String(g(C.CAT) || "").trim(), Unit: unit, Packaging: g(C.PACK) === undefined ? "" : g(C.PACK),
+    "W/H Opening Full Pack": openFull, "W/H Opening Loose": openLoose,
+    "Warehouse Stock Qty Opening STock": opening,
+    "Deman for canteen": num(g(C.DEMAND)), "Demand Unit": String(g(C.DEMANDUNIT) || "").trim(),
+    "Approved Demand Qty by supervisor": approved, "Approved QTY (Unit)": String(g(C.APPROVEDUNIT) || "").trim(),
+    "Purchase Stock  QTy": purchase, "Purchase Stock QTy (Unit)": String(g(C.PURCHASEUNIT) || "").trim(),
+    "Current Stock": cur, "Current Stock In Carton": round3(cur / suq), "Current Stock Pack": packText(cur, suq, unit, baseUnit),
+    Min: nb(g(C.MIN)), Max: nb(g(C.MAX)), Vendor: String(g(C.VENDOR) || "").trim(),
+    Rate: money(g(C.RATE)), "Unit of rate": String(g(C.RATEUNIT) || "").trim(),
+    "Expiry Date": normalizeDate(g(C.EXPIRY)),
+    "Base Unit": baseUnit, "1 Stock Unit = (Base Qty)": suq,
+    "Stock Type": daily ? "Daily Market" : "Stocked",
+  };
+}
+
 // =================== READERS ===================
 async function readStaff() { return rowsToObjects(await readRange(S.STAFF)); }
 
 async function readDemands() {
-  const rows = await readRange(S.DEMAND, "A1:O", "UNFORMATTED_VALUE");
+  const rows = await readRange(S.DEMAND, "A1:Q", "UNFORMATTED_VALUE");
   return rows.slice(1).reverse().map((r, i) => ({
     _row: rows.length - i, "Demand ID": r[0] || "",
     Timestamp: normalizeDateTime(r[1]),
     "Raised By": r[2] || "", "Item Name": r[3] || "", Category: r[4] || "",
     Unit: r[5] || "", "Qty Requested": r[6] || 0, Status: r[7] || "Pending",
-    "Warehouse Stock After": r[8] || "", Notes: r[9] || "",
-    "Approved Qty": r[10] || "", "Approved At": normalizeDateTime(r[11]),
+    "Warehouse Stock After": r[8] === undefined ? "" : r[8], Notes: r[9] || "",
+    "Approved Qty": r[10] === undefined ? "" : r[10], "Approved At": normalizeDateTime(r[11]),
     Feedback: r[12] || "", "Feedback At": normalizeDateTime(r[13]),
     "Approved By": r[14] || "",
+    Rate: money(r[15]), Amount: money(r[16]),
   })).filter(d => d["Demand ID"] || d["Item Name"]);
 }
 
 async function readProducts() {
-  const rows = await readRange(S.PRODUCTS, "A1:ZZ", "FORMATTED_VALUE");
-  if (rows.length < 2) return [];
-  const H = rows[0].map(normH);
-  const find = (pred, def) => { for (let i = 0; i < H.length; i++) if (H[i] && pred(H[i])) return i; return def; };
-  const C = {
-    NAME: find(x => x.indexOf("item name") === 0, 1), CAT: find(x => x === "category", 2),
-    PACK: find(x => x.indexOf("packaging") !== -1, 3), UNIT: find(x => x === "unit", 4),
-    OPENFULL: find(x => x.indexOf("full pack") !== -1, 5), OPENLOOSE: find(x => x.indexOf("loose") !== -1, 6),
-    DEMAND: find(x => x.indexOf("deman") === 0 && x.indexOf("approved") === -1 && x.indexOf("unit") === -1, 7),
-    DEMANDUNIT: find(x => x.indexOf("demand unit") !== -1, 8),
-    APPROVED: find(x => x.indexOf("approved") !== -1, 9), PURCHASE: find(x => x.indexOf("purchase") !== -1, 10),
-    MIN: find(x => x === "min", 13), MAX: find(x => x === "max", 14), VENDOR: find(x => x === "vendor", 15),
-    RATE: find(x => x === "rate", 16), RATEUNIT: find(x => x.indexOf("unit of rate") !== -1, 17),
-    EXPIRY: find(x => x.indexOf("expiry") === 0, 18), BASEUNIT: find(x => x.indexOf("base unit") !== -1, 19),
-    STOCKUNITQTY: find(x => x.indexOf("stock unit") !== -1 || x.indexOf("base qty") !== -1, 20),
-    STOCKTYPE: find(x => x.indexOf("stock type") !== -1, 21),
-  };
+  const rows = await readRange(S.PRODUCTS, "A1:ZZ", "UNFORMATTED_VALUE");
+  if (!rows.length) return [];
+  PCOL = buildProdCols(rows[0]);
   const out = [];
   for (let i = 1; i < rows.length; i++) {
-    const r = rows[i]; if (!r || !String(r[C.NAME] || "").trim()) continue;
-    const openFull = num(r[C.OPENFULL]), openLoose = num(r[C.OPENLOOSE]);
-    const purchase = num(r[C.PURCHASE]), approved = num(r[C.APPROVED]);
-    const suq = num(r[C.STOCKUNITQTY]) || 1;
-    const opening = round3(openFull * suq + openLoose);
-    const currentPcs = round3(opening + purchase - approved);
-    out.push({
-      _row: i + 1, "Item Name (Standardized)": String(r[C.NAME]).trim(),
-      Category: r[C.CAT] || "", Unit: r[C.UNIT] || "", Packaging: r[C.PACK] || "",
-      "W/H Opening Full Pack": openFull, "W/H Opening Loose": openLoose,
-      "Warehouse Stock Qty Opening STock": opening,
-      "Deman for canteen": num(r[C.DEMAND]), "Demand Unit": r[C.DEMANDUNIT] || "",
-      "Approved Demand Qty by supervisor": approved, "Purchase Stock  QTy": purchase,
-      "Current Stock": currentPcs, "Current Stock In Carton": round3(currentPcs / suq),
-      Min: r[C.MIN], Max: r[C.MAX], Vendor: r[C.VENDOR] || "",
-      Rate: r[C.RATE], "Unit of rate": r[C.RATEUNIT] || "",
-      "Expiry Date": normalizeDate(r[C.EXPIRY]),
-      "Base Unit": r[C.BASEUNIT] || r[C.UNIT] || "", "1 Stock Unit = (Base Qty)": suq,
-      "Stock Type": r[C.STOCKTYPE] || "Stocked",
-    });
+    const p = rowToProduct(rows[i], i + 1, PCOL);
+    if (p) out.push(p);
   }
   return out;
 }
+async function getProdCols() {
+  if (!PCOL) { cache.del("products"); await cached("products", readProducts); }
+  return PCOL;
+}
+async function readProductRowRaw(row) {
+  return (await readRange(S.PRODUCTS, `A${row}:ZZ${row}`, "UNFORMATTED_VALUE"))[0] || [];
+}
+async function findProduct(name) {
+  const n = normH(name); if (!n) return null;
+  let list = await cached("products", readProducts);
+  let it = list.find(x => normH(x["Item Name (Standardized)"]) === n);
+  if (!it) { cache.del("products"); list = await cached("products", readProducts); it = list.find(x => normH(x["Item Name (Standardized)"]) === n); }
+  return it || null;
+}
+function patchProductCache(prod) {
+  const list = cache.get("products");
+  if (!list || !prod) return;
+  let found = false;
+  const next = list.map(x => { if (x._row === prod._row) { found = true; return prod; } return x; });
+  if (!found) next.push(prod);
+  cache.set("products", next, TTL.products);
+}
+
+// 🆕 Product Master ki kisi bhi row ko sahi tarike se badalna:
+// lock → us row ko sheet se FRESH padho → naya value nikaalo → ek hi call mein likho → cache update.
+// Current Stock (carton/pcs) ke formula columns mein kabhi nahi likhta.
+async function mutateProduct(ref, fn) {
+  return withLock("products", async () => {
+    const C = await getProdCols();
+    let item = null;
+    if (ref.row) {
+      item = (await cached("products", readProducts)).find(x => x._row === Number(ref.row));
+      if (!item) { cache.del("products"); item = (await cached("products", readProducts)).find(x => x._row === Number(ref.row)); }
+    } else item = await findProduct(ref.name);
+    if (!item) throw new Error("Item nahi mila: " + (ref.name || ("row " + ref.row)));
+
+    let raw = await readProductRowRaw(item._row);
+    if (normH(raw[C.NAME]) !== normH(item["Item Name (Standardized)"])) {
+      // Sheet mein kisi ne row upar-neeche kar di — fresh list se dobara dhoondo
+      cache.del("products");
+      const again = await findProduct(item["Item Name (Standardized)"]);
+      if (!again) throw new Error("Sheet badal gayi hai — page refresh karke dobara try karo.");
+      item = again;
+      raw = await readProductRowRaw(item._row);
+      if (normH(raw[C.NAME]) !== normH(item["Item Name (Standardized)"])) throw new Error("Sheet badal gayi hai — page refresh karke dobara try karo.");
+    }
+    const before = rowToProduct(raw, item._row, C);
+    const changes = (await fn(before, C)) || {};
+    const cells = [];
+    for (const k of Object.keys(changes)) {
+      const idx = Number(k);
+      if (idx === C.CURCARTON || idx === C.CURPCS) throw new Error("Current Stock formula column mein likhna allowed nahi hai.");
+      cells.push({ row: item._row, col: idx + 1, value: changes[k] });
+      raw[idx] = changes[k];
+    }
+    await batchWrite(S.PRODUCTS, cells);
+    const after = rowToProduct(raw, item._row, C);
+    patchProductCache(after);
+    DATA_VER++; cache.del("dash"); cache.del("vendors");
+    return { before, after };
+  });
+}
+
+// =================== 🆕 UNIT CONVERSION ===================
+// Har item ke 2 hi unit allowed hain: "Unit" (chhota, jaise pcs) aur "Base Unit" (bada, jaise pkt/box/vori).
+// Sheet ke saare totals (Opening Loose, Demand, Approved, Purchase) hamesha "Unit" mein rakhe jaate hain,
+// isliye Base Unit mein di gayi qty ko × "1 Stock Unit = (Base Qty)" karke likha jata hai.
+function allowedUnits(item) {
+  const s = [];
+  [item.Unit, item["Base Unit"]].forEach(u => { u = String(u || "").trim(); if (u && !s.some(x => normH(x) === normH(u))) s.push(u); });
+  return s;
+}
+function toNative(item, qty, unit) {
+  const suq = num(item["1 Stock Unit = (Base Qty)"]) || 1;
+  const u = normH(unit || item.Unit);
+  if (u && u === normH(item["Base Unit"]) && u !== normH(item.Unit)) return round3(qty * suq);
+  return round3(qty);
+}
+function checkUnit(item, unit, role) {
+  const allowed = allowedUnits(item);
+  if (!unit) return item.Unit;
+  const hit = allowed.find(u => normH(u) === normH(unit));
+  if (hit) return hit;
+  if (role === "Hero") return String(unit).trim();
+  throw new Error(`"${unit}" unit "${item["Item Name (Standardized)"]}" ke liye allowed nahi — sirf ${allowed.join(" / ")}. Naya unit sirf Hero bana sakta hai.`);
+}
+// Full Pack / Loose ko total ke hisaab se adjust karna (total = Full × 1Base + Loose)
+function openingCells(b, total, C) {
+  const suq = num(b["1 Stock Unit = (Base Qty)"]) || 1;
+  total = round3(total);
+  if (suq <= 1) return { [C.OPENLOOSE]: round3(total - b["W/H Opening Full Pack"]) };
+  if (total < 0) return { [C.OPENFULL]: 0, [C.OPENLOOSE]: total };
+  const full = Math.floor(total / suq + 1e-9);
+  return { [C.OPENFULL]: full, [C.OPENLOOSE]: round3(total - full * suq) };
+}
+
+// =================== 🆕 RATE HISTORY (purana rate → naya rate) ===================
+const RATE_HDR = ["Timestamp", "Item Name", "Old Rate", "New Rate", "Unit of rate", "Source", "By", "Ref"];
+function logRateChange(itemName, oldRate, newRate, unit, source, by, ref) {
+  if (newRate === "" || newRate === null || newRate === undefined || isNaN(Number(newRate))) return;
+  if (oldRate !== "" && oldRate !== undefined && Number(oldRate) === Number(newRate)) return;
+  (async () => {
+    try {
+      await ensureSheet(S.RATEHIST, RATE_HDR);
+      await appendRow(S.RATEHIST, [toISTISO(new Date()), itemName, (oldRate === "" || oldRate === undefined) ? "" : oldRate, Number(newRate), unit || "", source || "", by || "", ref || ""]);
+      cache.del("ratehist");
+    } catch (e) { console.error("Rate history:", e.message); }
+  })();
+}
+async function readRateHistory() {
+  const m = await sheetMeta();
+  if (!m[S.RATEHIST]) return [];
+  const objs = rowsToObjects(await readRange(S.RATEHIST, "A1:H", "UNFORMATTED_VALUE"));
+  objs.forEach(o => { o.Timestamp = normalizeDateTime(o.Timestamp); o["Old Rate"] = money(o["Old Rate"]); o["New Rate"] = money(o["New Rate"]); });
+  return objs.slice(-1500).reverse();
+}
+
+// =================== OTHER READERS ===================
+// Sheet ke asli headers: Log ID | Timestamp | Item Name | Mode | Qty | Previous Stock | Resulting Stock | Entered By | Last Edited | Rate | Expiry Date | Status
+// (Unit, Qty (pcs), Unit of rate, Vendor naye columns end mein apne aap ban jate hain)
+const WH_HDR = ["Log ID", "Timestamp", "Item Name", "Mode", "Qty", "Unit", "Qty (pcs)", "Previous Stock", "Resulting Stock", "Entered By", "Rate", "Unit of rate", "Expiry Date", "Vendor", "Status", "Last Edited"];
+const WH_ALIAS = { "Log ID": /\bid\b/i };
+const PO_ALIAS = { "PO ID": /^po\s*id$/i };
 
 async function readWarehouseEntries() {
   const objs = rowsToObjects(await readRange(S.WHLOG, "A1:ZZ", "FORMATTED_VALUE"));
-  objs.forEach(o => { o['Timestamp'] = normalizeDateTime(o['Timestamp']); o['Expiry Date'] = normalizeDate(o['Expiry Date']); o['Last Edited'] = normalizeDateTime(o['Last Edited']); });
-  return objs.slice(-200).reverse();
+  objs.forEach(o => { o["Timestamp"] = normalizeDateTime(o["Timestamp"]); o["Expiry Date"] = normalizeDate(o["Expiry Date"]); o["Last Edited"] = normalizeDateTime(o["Last Edited"]); o["Rate"] = money(o["Rate"]); });
+  return objs.filter(o => o["Item Name"]).slice(-300).reverse();
 }
 async function readCylinderEntries() {
   const objs = rowsToObjects(await readRange(S.CYLINDER, "A1:ZZ", "FORMATTED_VALUE"));
-  objs.forEach(o => { o['Timestamp'] = normalizeDateTime(o['Timestamp']); });
+  objs.forEach(o => { o["Timestamp"] = normalizeDateTime(o["Timestamp"]); });
   return objs.slice(-200).reverse();
 }
 async function readPO() {
   const objs = rowsToObjects(await readRange(S.PO, "A1:ZZ", "FORMATTED_VALUE"));
-  objs.forEach(o => { o['Timestamp'] = normalizeDateTime(o['Timestamp']); o['Expiry Date'] = normalizeDate(o['Expiry Date']); });
+  objs.forEach(o => { o["Timestamp"] = normalizeDateTime(o["Timestamp"]); o["Expiry Date"] = normalizeDate(o["Expiry Date"]); o["Last Edited"] = normalizeDateTime(o["Last Edited"]); if (o["Rate"] !== undefined) o["Rate"] = money(o["Rate"]); });
   return objs;
 }
 async function readManualPurchases() {
@@ -318,10 +608,10 @@ async function readAttendance() {
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i]; const obj = { _row: i + 2 };
     headers.forEach((h, idx) => { if (h) obj[h] = r[idx]; });
-    obj['Date'] = normalizeDate(obj['Date']);
-    obj['IN Time'] = normalizeDateTime(obj['IN Time'], obj['Date']);
-    obj['OUT Time'] = normalizeDateTime(obj['OUT Time'], obj['Date']);
-    if (!obj['User ID'] && !obj['Date']) continue;
+    obj["Date"] = normalizeDate(obj["Date"]);
+    obj["IN Time"] = normalizeDateTime(obj["IN Time"], obj["Date"]);
+    obj["OUT Time"] = normalizeDateTime(obj["OUT Time"], obj["Date"]);
+    if (!obj["User ID"] && !obj["Date"]) continue;
     out.push(obj);
   }
   return out;
@@ -363,128 +653,65 @@ function matchVendorForItem(name) {
   return "";
 }
 
-// =================== 🆕 FIND OR CREATE PRODUCT ===================
-// Item Product & Stock Master mein mile to wahi return karta hai.
-// Na mile aur frontend ne mode "new" (ya newName) bheja ho to naya row bana deta hai.
-// Demand, Warehouse Entry aur Manual Purchase teeno isi ko use karte hain.
-async function findOrCreateProduct(p) {
-  const name = String(p.itemName || p.newName || p.name || "").trim();
-  if (!name) throw new Error("Item ka naam khali hai");
-  const findIn = (list) => list.find(x => normH(x["Item Name (Standardized)"]) === normH(name));
-
-  let products = await cached("products", readProducts);
-  let item = findIn(products);
-  if (item) return { item, created: false };
-
-  // cache purana ho sakta hai — sheet se ek baar fresh padh ke dobara check karo
-  invalidate("products");
-  products = await cached("products", readProducts);
-  item = findIn(products);
-  if (item) return { item, created: false };
-
-  const isNew = p.mode === "new" || !!p.newName;
-  if (!isNew) throw new Error("Item not found: " + name);
-
-  const category = String(p.newCategory || p.category || "").trim();
-  const unit = String(p.newUnit || p.unit || "").trim();
-  if (!category || !unit) throw new Error("Naye item ke liye Category aur Unit zaroori hai");
-  const packaging = p.newPackaging || p.packaging || "";
-  const stockType = /daily/i.test(String(p.stockType || "")) ? "Daily Market" : "Stocked";
-
-  // Column order = handleAddProduct jaisa (Product & Stock Master sheet)
-  await appendRow(S.PRODUCTS, [
-    products.length + 1, name, category, packaging, unit,
-    0, 0, 0, p.demandUnit || unit, 0, 0, "", "",
-    Number(p.newMinStock) || 0, Number(p.newMaxStock) || 0, "", "", unit, "",
-    p.baseUnit || unit, Number(p.stockUnitQty) || 1, stockType
-  ]);
-
-  invalidate("products", "dash");
-  products = await cached("products", readProducts); // fresh read => sahi _row milega
-  item = findIn(products);
-  if (!item) throw new Error("Naya item banaya par sheet se wapas nahi mila — dobara try karo");
-  return { item, created: true };
-}
-
-// =================== 🆕 AUTO-PO ENGINE ===================
+// =================== AUTO-PO ENGINE ===================
 async function checkAndCreateAutoPO(itemName) {
   if (!itemName) return null;
-  const products = await cached("products", readProducts);
-  const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(itemName));
-  if (!item) return null;
-
-  const min = num(item.Min);
-  const max = num(item.Max);
-  const cur = num(item["Current Stock"]);
-
-  // Only trigger if Min set and stock at/below Min
-  if (min <= 0) return null;
-  if (cur > min) return null;
-
-  // Formula: qty = max > min ? (max - current) : (min * 2 - current)
-  let orderQty;
-  if (max > min) orderQty = Math.max(1, round3(max - cur));
-  else orderQty = Math.max(1, round3(min * 2 - cur));
-
-  // Duplicate safety: agar Pending PO pehle se hai us item ka
-  const pos = await cached("po", readPO);
-  const existingPending = pos.find(p =>
-    normH(String(p["Item Name"] || "")) === normH(itemName) &&
-    String(p.Status || "").trim() === "Pending"
-  );
-  if (existingPending) {
-    return { skipped: true, reason: "Pending PO already exists", row: existingPending._row, existingQty: existingPending["Qty Ordered"] };
-  }
-
-  const poId = "APO-" + Date.now() + "-" + Math.floor(Math.random() * 90 + 10);
-  const vendor = item.Vendor || "Unassigned";
-  const ts = toISTISO(new Date());
-  // Columns: PO ID, Timestamp, Item Name, Category, Unit, Qty, Status, Requested By, Notes, Vendor
-  await appendRow(S.PO, [
-    poId, ts, item["Item Name (Standardized)"], item.Category || "",
-    item.Unit || "", orderQty, "Pending", "AUTO-PO",
-    `Auto: Stock ${cur} <= Min ${min}`, vendor
-  ]);
-  invalidate("po", "po_batches", "mpo", "dash");
-  return { created: true, poId, itemName: item["Item Name (Standardized)"], qty: orderQty, current: cur, min, max, vendor };
+  return withLock("autopo", async () => {
+    const item = await findProduct(itemName);
+    if (!item || isDaily(item["Stock Type"])) return null;
+    const min = num(item.Min), max = num(item.Max), cur = num(item["Current Stock"]);
+    if (min <= 0 || cur > min) return null;
+    const orderQty = max > min ? Math.max(1, round3(max - cur)) : Math.max(1, round3(min * 2 - cur));
+    cache.del("po");
+    const pos = await cached("po", readPO);
+    const existing = pos.find(p => normH(p["Item Name"]) === normH(itemName) && String(p.Status || "").trim() === "Pending");
+    if (existing) return { skipped: true, reason: "Pending PO already exists", row: existing._row };
+    const poId = "APO-" + Date.now() + "-" + Math.floor(Math.random() * 90 + 10);
+    const vendor = item.Vendor || "Unassigned";
+    await appendByHeaders(S.PO, {
+      "PO ID": poId, "Timestamp": toISTISO(new Date()), "Item Name": item["Item Name (Standardized)"], "Category": item.Category || "",
+      "Unit": item.Unit || "", "Qty Ordered": orderQty, "Status": "Pending", "Requested By": "AUTO-PO",
+      "Notes": `Auto: Stock ${cur} <= Min ${min}`, "Vendor": vendor,
+    }, PO_ALIAS);
+    invalidate("po", "po_batches", "mpo", "dash");
+    return { created: true, poId, itemName: item["Item Name (Standardized)"], qty: orderQty, current: cur, min, max, vendor };
+  });
 }
-
 async function runAutoPOForAll() {
   const products = await cached("products", readProducts);
   const results = { created: [], skipped: [], failed: [] };
   for (const p of products) {
-    const min = num(p.Min);
-    const cur = num(p["Current Stock"]);
-    if (min > 0 && cur <= min) {
+    if (num(p.Min) > 0 && num(p["Current Stock"]) <= num(p.Min) && !isDaily(p["Stock Type"])) {
       try {
         const r = await checkAndCreateAutoPO(p["Item Name (Standardized)"]);
         if (r && r.created) results.created.push(r);
         else if (r && r.skipped) results.skipped.push({ name: p["Item Name (Standardized)"], reason: r.reason });
-      } catch (e) {
-        results.failed.push({ name: p["Item Name (Standardized)"], error: e.message });
-      }
+      } catch (e) { results.failed.push({ name: p["Item Name (Standardized)"], error: e.message }); }
     }
   }
   return results;
 }
 
-// =================== HANDLERS ===================
+// =================== LOGIN / BOOTSTRAP / POLL / STATS ===================
+function wantForRole(perm) {
+  const want = [];
+  if (perm === "SuperAdmin") want.push("staff", "allAttendance");
+  else {
+    want.push("myAttendance");
+    if (perm === "Admin") want.push("stats", "products", "demands");
+    else if (perm === "Hero") want.push("stats", "products", "demands", "vendors");
+    else if (perm === "Supervisor") want.push("demands", "products", "vendors");
+    else if (perm === "Cashier") want.push("products", "demands");
+  }
+  return want;
+}
 async function handleLogin(p) {
   const staff = await cached("staff", readStaff);
   const match = staff.find(r => String(r.User || "").toLowerCase().trim() === String(p.userId).toLowerCase().trim() && String(r.Password || "").trim() === String(p.password).trim());
   if (!match) throw new Error("Invalid User ID or Password");
-  const result = { userId: match.User, name: match.Name, designation: match.Designation, shift: match["Shift Timing"], permission: match.Permission };
-  try {
-    const want = []; const perm = result.permission;
-    if (perm === "SuperAdmin") want.push("staff", "allAttendance");
-    else {
-      want.push("myAttendance");
-      if (perm === "Admin") want.push("stats", "products", "demands");
-      else if (perm === "Supervisor") want.push("demands", "products", "vendors");
-      else if (perm === "Cashier") want.push("products", "demands");
-    }
-    result.bootstrap = await handleBootstrap({ want, userId: result.userId });
-  } catch (e) { console.error("Bootstrap:", e.message); result.bootstrap = {}; }
+  const result = { userId: match.User, name: match.Name, designation: match.Designation, shift: match["Shift Timing"], permission: String(match.Permission || "").trim() };
+  try { result.bootstrap = await handleBootstrap({ want: wantForRole(result.permission), userId: result.userId }); }
+  catch (e) { console.error("Bootstrap:", e.message); result.bootstrap = {}; }
   return result;
 }
 
@@ -513,8 +740,8 @@ async function buildPoll() {
   let pending = 0, newest = null;
   demands.forEach(d => { if (d.Status === "Pending") { pending++; if (!newest || new Date(d.Timestamp) > new Date(newest.Timestamp)) newest = d; } });
   const products = await cached("products", readProducts).catch(() => []);
-  const sig = demands.length + "|" + demands.slice(0, 300).map(d => d["Demand ID"] + d.Status + d["Qty Requested"] + d["Approved Qty"] + d.Feedback).join(",")
-    + "|" + products.map(p => p["Current Stock"]).join(",");
+  const sig = demands.length + "|" + demands.slice(0, 300).map(d => d["Demand ID"] + d.Status + d["Qty Requested"] + d["Approved Qty"] + d.Feedback + d.Rate).join(",")
+    + "|" + products.map(p => p["Item Name (Standardized)"] + p["Current Stock"] + p.Rate).join(",");
   return { ver: DATA_VER + "-" + hashStr(sig), pending, newest: newest ? { item: newest["Item Name"], qty: newest["Qty Requested"], unit: newest.Unit, by: newest["Raised By"] } : null };
 }
 
@@ -527,14 +754,13 @@ async function buildDashboardStats() {
   const istNow = new Date(Date.now() + 5.5 * 3600000);
   const today = istNow.toISOString().slice(0, 10);
   const presentIds = new Set(attendance.filter(a => String(a.Date || "").slice(0, 10) === today && a["IN Time"]).map(a => a["User ID"]));
-  const totalStaff = staff.filter(s => s.Permission !== "Admin" && s.Permission !== "SuperAdmin").length;
+  const totalStaff = staff.filter(s => s.Permission !== "Admin" && s.Permission !== "SuperAdmin" && s.Permission !== "Hero").length;
   const health = { healthy: 0, low: 0, overstock: 0 };
   const categoryStock = {};
   products.forEach(p => {
-    const min = num(p.Min), max = num(p.Max);
-    // 🔧 FIX: Compare against PCS (Current Stock), not carton
-    const cur = num(p["Current Stock"]);
-    const cat = p.Category || "Other"; categoryStock[cat] = (categoryStock[cat] || 0) + num(p["Current Stock"]);
+    if (isDaily(p["Stock Type"])) return;
+    const min = num(p.Min), max = num(p.Max), cur = num(p["Current Stock"]);
+    const cat = p.Category || "Other"; categoryStock[cat] = round3((categoryStock[cat] || 0) + cur);
     if (min > 0 && cur <= min) health.low++; else if (max > 0 && cur >= max) health.overstock++; else health.healthy++;
   });
   const trend = [];
@@ -551,142 +777,167 @@ async function buildDashboardStats() {
 }
 
 // =================== DEMAND HANDLERS ===================
-async function handleAddDemand(p) {
-  // 🆕 Item mile to use karo, nahi to (mode "new" par) Product Master mein naya bana do
-  const { item } = await findOrCreateProduct(p);
-  const itemName = item["Item Name (Standardized)"];
-  const id = "DMD-" + Date.now() + "-" + Math.floor(Math.random() * 90 + 10);
-  const ts = toISTISO(new Date()); // 🆕 IST
-  const rowNum = await appendRow(S.DEMAND, [id, ts, p.raisedBy || "", itemName, p.category || item.Category || "", p.unit || item.Unit || "", Number(p.qty) || 0, "Pending", "", p.notes || "", "", "", "", ""]);
-  if (item._row) {
-    const newDemand = num(item["Deman for canteen"]) + num(p.qty);
-    await writeCell(S.PRODUCTS, item._row, 8, newDemand);
-  }
-  invalidate("demands", "products", "dash");
-  return { id, row: rowNum, itemName };
+// Demand sheet: A ID | B Timestamp | C Raised By | D Item | E Category | F Unit | G Qty | H Status |
+// I Warehouse Stock After | J Notes | K Approved Qty | L Approved At | M Feedback | N Feedback At |
+// O Approved By | P Rate (₹/unit) | Q Amount (₹)
+let DEMAND_HDR_OK = false;
+async function ensureDemandHeaders() {
+  if (DEMAND_HDR_OK) return;
+  try {
+    await ensureCols(S.DEMAND, 17);
+    const h = (await readRange(S.DEMAND, "O1:Q1", "FORMATTED_VALUE"))[0] || [];
+    const want = ["Approved By", "Rate (₹/unit)", "Amount (₹)"];
+    const cells = [];
+    want.forEach((w, i) => { if (!String(h[i] || "").trim()) cells.push({ row: 1, col: 15 + i, value: w }); });
+    await batchWrite(S.DEMAND, cells);
+    DEMAND_HDR_OK = true;
+  } catch (e) { console.error("Demand headers:", e.message); }
+}
+async function readDemandRow(row) {
+  return (await readRange(S.DEMAND, `A${row}:Q${row}`, "UNFORMATTED_VALUE"))[0] || [];
+}
+function whoLabel(name, role) {
+  const n = String(name || "").trim(); const r = String(role || "").trim();
+  return n ? (r ? `${n} (${r})` : n) : "";
 }
 
-async function readDemandRow(row) {
-  const demRows = await readRange(S.DEMAND, `A${row}:O${row}`, "UNFORMATTED_VALUE");
-  return demRows[0] || [];
+async function handleAddDemand(p) {
+  // Cashier sirf list wale item ki demand daal sakta hai — naya item sirf Hero banata hai
+  if (p.mode === "new" || p.newName) throw new Error("Naya item sirf Hero bana sakta hai — dropdown se item chuno.");
+  const role = await roleOf(p);
+  const item = await findProduct(p.itemName);
+  if (!item) throw new Error(`"${p.itemName}" list mein nahi hai — Hero se item banwao.`);
+  const qty = num(p.qty); if (!(qty > 0)) throw new Error("Valid quantity daalo");
+  const unit = checkUnit(item, p.unit, role);
+  await ensureDemandHeaders();
+  const itemName = item["Item Name (Standardized)"];
+  const id = "DMD-" + Date.now() + "-" + Math.floor(Math.random() * 90 + 10);
+  const rowNum = await appendRow(S.DEMAND, [id, toISTISO(new Date()), p.raisedBy || "", itemName, item.Category || "", unit, qty, "Pending", "", p.notes || "", "", "", "", "", "", "", ""]);
+  const native = toNative(item, qty, unit);
+  const { after } = await mutateProduct({ name: itemName }, (b, C) => ({ [C.DEMAND]: round3(b["Deman for canteen"] + native), [C.DEMANDUNIT]: b.Unit }));
+  invalidate("demands", "dash");
+  return { id, row: rowNum, itemName, unit, product: after };
 }
-// Header O1 "Approved By" na ho to bana do (ek baar)
-let DEMAND_HEADER_OK = false;
-async function ensureApprovedByHeader() {
-  if (DEMAND_HEADER_OK) return;
-  try {
-    const h = await readRange(S.DEMAND, "O1:O1", "FORMATTED_VALUE");
-    if (!h[0] || !String(h[0][0] || "").trim()) await writeCell(S.DEMAND, 1, 15, "Approved By");
-    DEMAND_HEADER_OK = true;
-  } catch (e) { console.error("Approved By header:", e.message); }
-}
-// Product sheet ka cell agar formula hai to use overwrite nahi karna
-async function isFormulaCell(sheetName, row, col) {
-  try {
-    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `'${sheetName}'!${colLetter(col)}${row}`, valueRenderOption: "FORMULA" });
-    const v = ((res.data.values || [])[0] || [])[0];
-    return typeof v === "string" && v.trim().startsWith("=");
-  } catch (e) { return true; }
-}
-function whoLabel(p) {
-  const n = String(p.approvedBy || p.by || "").trim();
-  const r = String(p.role || "").trim();
-  return n ? (r ? `${n} (${r})` : n) : "";
+
+async function approveOne(it, role, by) {
+  const row = Number(it.row); if (!row || row < 2) throw new Error("Invalid row");
+  const approved = Number(it.approvedQty);
+  if (it.approvedQty === "" || it.approvedQty === undefined || isNaN(approved) || approved < 0) throw new Error("Approve qty sahi nahi hai");
+  const d = await readDemandRow(row);
+  const status = String(d[7] || "Pending").trim();
+  if (status !== "Pending") throw new Error("Ye demand pehle hi " + status + " ho chuki hai.");
+  const itemName = String(d[3] || "").trim();
+  const item = await findProduct(itemName);
+  if (!item) throw new Error(`"${itemName}" Product Master mein nahi mila — Hero se item check karwao.`);
+  const daily = isDaily(item["Stock Type"]);
+  if (role) {
+    if (daily && !["Cashier", "Hero"].includes(role)) throw new Error("Daily-Market demand Cashier (ya Hero) approve karta hai.");
+    if (!daily && !["Supervisor", "Hero"].includes(role)) throw new Error("Stocked demand sirf Supervisor (ya Hero) approve kar sakta hai.");
+  }
+  let unit;
+  try { unit = checkUnit(item, it.unit || d[5] || item.Unit, role); }
+  catch (e) { if (it.unit) throw e; unit = item.Unit; } // purani demand ka galat unit → item ka Unit
+
+  // Daily Market: rate ya kul amount zaroori (kitne ka pada)
+  let rate = "", amount = "";
+  if (daily && approved > 0) {
+    rate = money(it.rate); amount = money(it.amount);
+    const okRate = rate !== "" && rate > 0, okAmt = amount !== "" && amount > 0;
+    if (!okRate && !okAmt) throw new Error(`${itemName}: Daily Market approve karte time rate ya kul amount daalna zaroori hai.`);
+    if (!okRate) rate = round2(amount / approved);
+    if (!okAmt) amount = round2(rate * approved);
+  }
+  const nowIso = toISTISO(new Date());
+  const native = toNative(item, approved, unit);
+  let product = item, warning = "", productDelta = 0;
+  if (!daily && native > 0) {
+    // Stocked: Approved Demand Qty (J) mein Unit (pcs) ke hisaab se jodo, K = Unit
+    const res = await mutateProduct({ name: itemName }, (b, C) => ({ [C.APPROVED]: round3(b["Approved Demand Qty by supervisor"] + native), [C.APPROVEDUNIT]: b.Unit }));
+    product = res.after; productDelta = native;
+    if (product["Current Stock"] < 0) warning = `${itemName}: approve ke baad stock ${product["Current Stock"]} ${product.Unit} (minus) ho gaya — Warehouse/Purchase entry check karo.`;
+  } else if (daily && rate !== "") {
+    // Daily Market: Product Master ka Rate + Unit of rate update, purana→naya Rate History mein
+    const res = await mutateProduct({ name: itemName }, (b, C) => {
+      const ch = {};
+      if (String(b.Rate) !== String(rate)) ch[C.RATE] = rate;
+      if (normH(b["Unit of rate"]) !== normH(unit)) ch[C.RATEUNIT] = unit;
+      return ch;
+    });
+    product = res.after;
+    if (String(res.before.Rate) !== String(rate)) logRateChange(itemName, res.before.Rate, rate, unit, "Daily Market approve", by, d[0]);
+  }
+  const fb = String(it.feedback || "").trim().slice(0, 500);
+  const cells = [
+    { row, col: 8, value: "Approved" }, { row, col: 6, value: unit }, { row, col: 11, value: approved },
+    { row, col: 12, value: nowIso }, { row, col: 9, value: daily ? "" : product["Current Stock"] },
+  ];
+  if (by) cells.push({ row, col: 15, value: by });
+  if (rate !== "") cells.push({ row, col: 16, value: rate }, { row, col: 17, value: amount });
+  if (fb) cells.push({ row, col: 13, value: fb }, { row, col: 14, value: nowIso });
+  try { await batchWrite(S.DEMAND, cells); }
+  catch (e) {
+    if (productDelta) { try { await mutateProduct({ name: itemName }, (b, C) => ({ [C.APPROVED]: round3(b["Approved Demand Qty by supervisor"] - productDelta) })); } catch (_) {} }
+    throw e;
+  }
+  let autoPO = null;
+  if (!daily) { try { const r = await checkAndCreateAutoPO(itemName); if (r && r.created) autoPO = r; } catch (e) { console.error("AutoPO:", e.message); } }
+  return { autoPO, result: { row, ok: true, approvedQty: approved, unit, rate, amount, approvedBy: by, approvedAt: nowIso, warning, product } };
 }
 
 async function handleApproveDemands(p) {
   const items = Array.isArray(p.items) ? p.items : [];
   if (!items.length) throw new Error("Koi demand select nahi hui.");
-  await ensureApprovedByHeader();
-  const by = whoLabel(p);
-  const results = [];
-  const autoPOs = [];
+  await ensureDemandHeaders();
+  const role = await roleOf(p);
+  const by = whoLabel(p.approvedBy || p.by, role || p.role);
+  const results = [], autoPOs = [];
   for (const it of items) {
     try {
-      const row = Number(it.row); if (!row || row < 2) throw new Error("Invalid row");
-      const approved = Number(it.approvedQty);
-      if (isNaN(approved) || approved < 0) throw new Error("Approve qty sahi nahi hai");
-      const feedback = String(it.feedback || "").trim();
-      const nowIso = toISTISO(new Date());
-
-      const demR = await readDemandRow(row);
-      const status = String(demR[7] || "Pending").trim();
-      if (status !== "Pending") throw new Error("Ye demand pehle hi " + status + " ho chuki hai.");
-      const itemName = String(demR[3] || "").trim();
-      const unit = String(it.unit || demR[5] || "").trim();
-
-      // Approve qty ki koi limit nahi — stock kam ho to bhi approve hoga (sirf warning)
-      await writeCell(S.DEMAND, row, 8, "Approved");
-      if (it.unit) await writeCell(S.DEMAND, row, 6, unit);
-      await writeCell(S.DEMAND, row, 11, approved);
-      await writeCell(S.DEMAND, row, 12, nowIso);
-      if (by) await writeCell(S.DEMAND, row, 15, by);
-      if (feedback) { await writeCell(S.DEMAND, row, 13, feedback); await writeCell(S.DEMAND, row, 14, nowIso); }
-
-      // Stocked item ho to "Approved Demand Qty" badhao (warehouse stock kam hota hai)
-      let warning = "";
-      if (itemName && approved > 0) {
-        invalidate("products");
-        const products = await cached("products", readProducts);
-        const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(itemName));
-        if (item && !/daily/i.test(String(item["Stock Type"] || ""))) {
-          const suq = num(item["1 Stock Unit = (Base Qty)"]) || 1;
-          const isBase = unit && normH(unit) === normH(item["Base Unit"]) && normH(unit) !== normH(item.Unit);
-          const qtyPcs = round3(isBase ? approved * suq : approved);
-          if (!(await isFormulaCell(S.PRODUCTS, item._row, 10))) {
-            await writeCell(S.PRODUCTS, item._row, 10, round3(num(item["Approved Demand Qty by supervisor"]) + qtyPcs));
-          }
-          if (qtyPcs > num(item["Current Stock"])) warning = `${itemName}: approve qty (${qtyPcs} ${item.Unit}) current stock (${item["Current Stock"]}) se zyada hai — stock minus mein jayega.`;
-          invalidate("products");
-          try {
-            const poRes = await checkAndCreateAutoPO(itemName);
-            if (poRes && poRes.created) autoPOs.push(poRes);
-          } catch (e) { console.error("AutoPO on approve:", e.message); }
-        }
-      }
-      results.push({ row, ok: true, approvedQty: approved, approvedBy: by, approvedAt: nowIso, warning });
+      const r = await withLock("demand:" + Number(it.row), () => approveOne(it, role, by));
+      if (r.autoPO) autoPOs.push(r.autoPO);
+      results.push(r.result);
     } catch (e) { results.push({ row: it.row, ok: false, error: e.message }); }
   }
-  invalidate("demands", "products", "dash");
+  invalidate("demands", "dash");
   return { results, autoPOs };
+}
+
+async function reduceProductDemand(itemName, qty, unit) {
+  if (!itemName || !qty) return null;
+  const item = await findProduct(itemName);
+  if (!item) return null;
+  const native = toNative(item, qty, unit || item.Unit);
+  const { after } = await mutateProduct({ name: itemName }, (b, C) => ({ [C.DEMAND]: Math.max(0, round3(b["Deman for canteen"] - native)) }));
+  return after;
 }
 
 async function handleRejectDemands(p) {
   const rows = Array.isArray(p.rows) ? p.rows.map(Number) : [];
   if (!rows.length) throw new Error("Koi demand select nahi hui.");
-  await ensureApprovedByHeader();
-  const by = whoLabel(p);
+  await ensureDemandHeaders();
+  const role = await roleOf(p);
+  const by = whoLabel(p.approvedBy || p.by, role || p.role);
   const results = [];
   for (const row of rows) {
     try {
-      if (!row || row < 2) throw new Error("Invalid row");
-      const r = await readDemandRow(row);
-      const status = String(r[7] || "Pending").trim();
-      if (status !== "Pending") throw new Error("Ye demand pehle hi " + status + " ho chuki hai.");
-      const itemName = String(r[3] || "").trim();
-      const qty = num(r[6]);
-      await reduceProductDemand(itemName, qty);
-      await writeCell(S.DEMAND, row, 8, "Rejected");
-      await writeCell(S.DEMAND, row, 12, toISTISO(new Date()));
-      if (by) await writeCell(S.DEMAND, row, 15, by);
-      results.push({ row, ok: true, subtracted: qty });
+      const product = await withLock("demand:" + row, async () => {
+        if (!row || row < 2) throw new Error("Invalid row");
+        const d = await readDemandRow(row);
+        const status = String(d[7] || "Pending").trim();
+        if (status !== "Pending") throw new Error("Ye demand pehle hi " + status + " ho chuki hai.");
+        const after = await reduceProductDemand(String(d[3] || "").trim(), num(d[6]), d[5]);
+        const cells = [{ row, col: 8, value: "Rejected" }, { row, col: 12, value: toISTISO(new Date()) }];
+        if (by) cells.push({ row, col: 15, value: by });
+        await batchWrite(S.DEMAND, cells);
+        return after;
+      });
+      results.push({ row, ok: true, product });
     } catch (e) { results.push({ row, ok: false, error: e.message }); }
   }
-  invalidate("demands", "products", "dash");
+  invalidate("demands", "dash");
   return { results };
 }
 
-async function reduceProductDemand(itemName, delta) {
-  if (!itemName || !delta) return;
-  const products = await cached("products", readProducts);
-  const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(itemName));
-  if (item && item._row) {
-    const newDemand = Math.max(0, round3(num(item["Deman for canteen"]) - delta));
-    await writeCell(S.PRODUCTS, item._row, 8, newDemand);
-  }
-}
-
-// Edit/Delete: sirf Pending demand, sirf banane wala, sirf 1 ghante ke andar
 function assertEditable(r, p) {
   const status = String(r[7] || "Pending").trim();
   if (status !== "Pending") throw new Error("Ye demand pehle hi " + status + " ho chuki hai.");
@@ -700,31 +951,36 @@ async function handleEditDemand(p) {
   if (!row || row < 2) throw new Error("Invalid row");
   const newQty = Number(p.newQty);
   if (isNaN(newQty) || newQty <= 0) throw new Error("Invalid quantity");
-  const r = await readDemandRow(row);
-  assertEditable(r, p);
-  const itemName = String(r[3] || "").trim();
-  const oldQty = num(r[6]);
-  const diff = round3(newQty - oldQty);
-  if (diff !== 0) await reduceProductDemand(itemName, -diff);
-  await writeCell(S.DEMAND, row, 7, newQty);
-  invalidate("demands", "products", "dash");
-  return { row, oldQty, newQty, diff };
+  return withLock("demand:" + row, async () => {
+    const r = await readDemandRow(row);
+    assertEditable(r, p);
+    const itemName = String(r[3] || "").trim();
+    const oldQty = num(r[6]);
+    const item = await findProduct(itemName);
+    let product = null;
+    if (item) {
+      const diff = round3(toNative(item, newQty, r[5]) - toNative(item, oldQty, r[5]));
+      if (diff !== 0) product = (await mutateProduct({ name: itemName }, (b, C) => ({ [C.DEMAND]: Math.max(0, round3(b["Deman for canteen"] + diff)) }))).after;
+    }
+    await batchWrite(S.DEMAND, [{ row, col: 7, value: newQty }]);
+    invalidate("demands", "dash");
+    return { row, oldQty, newQty, product };
+  });
 }
 
 async function handleDeleteDemand(p) {
   const row = Number(p.row);
   if (!row || row < 2) throw new Error("Invalid row");
-  const r = await readDemandRow(row);
-  assertEditable(r, p);
-  const itemName = String(r[3] || "").trim();
-  const qty = num(r[6]);
-  await reduceProductDemand(itemName, qty);
-  await writeCell(S.DEMAND, row, 8, "Cancelled");
-  invalidate("demands", "products", "dash");
-  return { row, subtracted: qty };
+  return withLock("demand:" + row, async () => {
+    const r = await readDemandRow(row);
+    assertEditable(r, p);
+    const product = await reduceProductDemand(String(r[3] || "").trim(), num(r[6]), r[5]);
+    await batchWrite(S.DEMAND, [{ row, col: 8, value: "Cancelled" }]);
+    invalidate("demands", "dash");
+    return { row, product };
+  });
 }
 
-// Feedback: sirf Approved demand par, approve hone ke 3 din tak
 async function handleSaveDemandFeedback(p) {
   const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
   const feedback = String(p.feedback || "").trim().slice(0, 500);
@@ -734,8 +990,7 @@ async function handleSaveDemandFeedback(p) {
   const base = parseIST(normalizeDateTime(r[11])) || parseIST(normalizeDateTime(r[1]));
   if (!isNaN(base) && Date.now() - base > DEMAND_FEEDBACK_WINDOW_MS + GRACE_MS) throw new Error("3 din ho gaye — feedback ab lock ho chuka hai.");
   const nowIso = toISTISO(new Date());
-  await writeCell(S.DEMAND, row, 13, feedback);
-  await writeCell(S.DEMAND, row, 14, nowIso);
+  await batchWrite(S.DEMAND, [{ row, col: 13, value: feedback }, { row, col: 14, value: nowIso }]);
   invalidate("demands");
   return { row, feedback, feedbackAt: nowIso };
 }
@@ -743,8 +998,7 @@ async function handleSaveDemandFeedback(p) {
 // =================== ATTENDANCE HANDLERS ===================
 function businessDateKey(d) {
   const ist = new Date(new Date(d).getTime() + 5.5 * 3600000);
-  const hour = ist.getUTCHours();
-  if (hour < 3) ist.setUTCDate(ist.getUTCDate() - 1);
+  if (ist.getUTCHours() < 3) ist.setUTCDate(ist.getUTCDate() - 1);
   return ist.toISOString().slice(0, 10);
 }
 
@@ -752,7 +1006,6 @@ async function handleMarkAttendance(p) {
   const now = new Date();
   const dateStr = businessDateKey(now);
   const type = p.type === "OUT" ? "OUT" : "IN";
-
   const rows = await readRange(S.ATTENDANCE, "A1:R", "FORMATTED_VALUE");
   if (rows.length < 1) throw new Error("Attendance sheet khaali");
   const headers = rows[0].map(h => String(h).trim());
@@ -761,32 +1014,25 @@ async function handleMarkAttendance(p) {
   for (let i = 1; i < rows.length; i++) {
     if (String(rows[i][ci["User ID"]] || "").trim() === String(p.userId).trim() && normalizeDate(rows[i][ci["Date"]]) === dateStr) { todayRow = i + 1; break; }
   }
-
-  // 🆕 Pehle validate karo — rejected punch par photo upload nahi hogi
   if (type === "IN" && todayRow > 0 && rows[todayRow - 1][ci["IN Time"]]) throw new Error("Aap already IN punch kar chuke ho.");
   if (type === "OUT") {
     if (todayRow <= 0) throw new Error("Pehle IN punch karo.");
     if (rows[todayRow - 1][ci["OUT Time"]]) throw new Error("Aap already OUT punch kar chuke ho.");
   }
-
-  // 🆕 Photo upload (Apps Script → Drive). Fail hone par error Render Logs mein dikhega.
   const photoUrl = await uploadPhotoToDrive(p.photoBase64, p.userId, p.name || p.userId);
-
   const mapsLink = (p.lat && p.lng) ? ("https://www.google.com/maps?q=" + p.lat + "," + p.lng) : "";
-  // 🔧 FIX: Store IST wall-clock time
   const nowIso = toISTISO(now);
   let status;
   if (type === "IN") {
-    status = computeInStatus(p.shift, now); // On Time / Late
+    status = computeInStatus(p.shift, now);
     await appendRow(S.ATTENDANCE, [dateStr, p.userId, p.name || "", p.designation || "", p.shift || "", nowIso, photoUrl, mapsLink, p.lat || "", p.lng || "", status, "", "", "", "", "", "", "Present"]);
   } else {
-    status = computeOutStatus(p.shift, now); // On Time / Early Leave / Overtime
-    await writeCell(S.ATTENDANCE, todayRow, ci["OUT Time"] + 1, nowIso);
-    await writeCell(S.ATTENDANCE, todayRow, ci["OUT Photo URL"] + 1, photoUrl);
-    await writeCell(S.ATTENDANCE, todayRow, ci["OUT Maps Link"] + 1, mapsLink);
-    await writeCell(S.ATTENDANCE, todayRow, ci["OUT Latitude"] + 1, p.lat || "");
-    await writeCell(S.ATTENDANCE, todayRow, ci["OUT Longitude"] + 1, p.lng || "");
-    await writeCell(S.ATTENDANCE, todayRow, ci["OUT Status"] + 1, status);
+    status = computeOutStatus(p.shift, now);
+    const cells = [];
+    const put = (h, v) => { if (ci[h] !== undefined) cells.push({ row: todayRow, col: ci[h] + 1, value: v }); };
+    put("OUT Time", nowIso); put("OUT Photo URL", photoUrl); put("OUT Maps Link", mapsLink);
+    put("OUT Latitude", p.lat || ""); put("OUT Longitude", p.lng || ""); put("OUT Status", status);
+    await batchWrite(S.ATTENDANCE, cells);
   }
   invalidate("attendance", "dash");
   return { status, type, photoUrl, istTime: nowIso };
@@ -802,70 +1048,135 @@ async function handleEditAttendancePunch(p) {
     if (String(rows[i][ci["User ID"]] || "").trim() === String(p.userId).trim() && normalizeDate(rows[i][ci["Date"]]) === p.dateISO) { ex = i + 1; break; }
   }
   if (p.inTime) {
-    const ts = p.dateISO + "T" + p.inTime + ":00"; // already IST since typed manually
+    const ts = p.dateISO + "T" + p.inTime + ":00";
     const inMin = hmToMinutes(p.inTime);
     const inStatus = inMin === null ? "Marked" : computeInStatusAt(p.shift, inMin);
     if (ex > 0) {
-      await writeCell(S.ATTENDANCE, ex, ci["IN Time"] + 1, ts);
-      await writeCell(S.ATTENDANCE, ex, ci["IN Photo URL"] + 1, note);
-      if (ci["IN Status"] !== undefined) await writeCell(S.ATTENDANCE, ex, ci["IN Status"] + 1, inStatus);
+      const cells = [{ row: ex, col: ci["IN Time"] + 1, value: ts }, { row: ex, col: ci["IN Photo URL"] + 1, value: note }];
+      if (ci["IN Status"] !== undefined) cells.push({ row: ex, col: ci["IN Status"] + 1, value: inStatus });
+      await batchWrite(S.ATTENDANCE, cells);
     } else {
-      await appendRow(S.ATTENDANCE, [p.dateISO, p.userId, p.name, p.designation, p.shift, ts, note, "", "", "", inStatus, "", "", "", "", "", "", "Present"]);
+      ex = await appendRow(S.ATTENDANCE, [p.dateISO, p.userId, p.name, p.designation, p.shift, ts, note, "", "", "", inStatus, "", "", "", "", "", "", "Present"]);
     }
   }
   if (p.outTime) {
-    let ex2 = ex;
-    if (ex2 <= 0) {
-      const r2 = await readRange(S.ATTENDANCE, "A1:R", "FORMATTED_VALUE");
-      for (let i = 1; i < r2.length; i++) {
-        if (String(r2[i][ci["User ID"]] || "").trim() === String(p.userId).trim() && normalizeDate(r2[i][ci["Date"]]) === p.dateISO) { ex2 = i + 1; break; }
-      }
-    }
-    if (ex2 <= 0) throw new Error("Pehle IN set karo");
+    if (ex <= 0) throw new Error("Pehle IN set karo");
     const ts = p.dateISO + "T" + p.outTime + ":00";
     const outMin = hmToMinutes(p.outTime);
     const outStatus = outMin === null ? "Marked" : computeOutStatusAt(p.shift, outMin);
-    await writeCell(S.ATTENDANCE, ex2, ci["OUT Time"] + 1, ts);
-    await writeCell(S.ATTENDANCE, ex2, ci["OUT Photo URL"] + 1, note);
-    if (ci["OUT Status"] !== undefined) await writeCell(S.ATTENDANCE, ex2, ci["OUT Status"] + 1, outStatus);
+    const cells = [{ row: ex, col: ci["OUT Time"] + 1, value: ts }, { row: ex, col: ci["OUT Photo URL"] + 1, value: note }];
+    if (ci["OUT Status"] !== undefined) cells.push({ row: ex, col: ci["OUT Status"] + 1, value: outStatus });
+    await batchWrite(S.ATTENDANCE, cells);
   }
   invalidate("attendance", "dash");
   return { ok: true };
 }
 
-// =================== WAREHOUSE HANDLERS ===================
-async function handleAddWarehouseEntry(p) {
-  // 🆕 Naya item ho to pehle Product Master mein bana do
-  const { item } = await findOrCreateProduct(p);
-  const qty = Number(p.qty) || 0; if (qty <= 0) throw new Error("Invalid quantity");
-  const newLoose = round3(num(item["W/H Opening Loose"]) + qty);
-  await writeCell(S.PRODUCTS, item._row, 7, newLoose);
-  if (p.rate) await writeCell(S.PRODUCTS, item._row, 17, Number(p.rate));
-  if (p.expiryDate) await writeCell(S.PRODUCTS, item._row, 19, p.expiryDate);
-  const logRow = await appendRow(S.WHLOG, ["WH-" + Date.now(), toISTISO(new Date()), item["Item Name (Standardized)"], "add", qty, item["Current Stock"], round3(num(item["Current Stock"]) + qty), p.enteredBy || "", ""]);
-  invalidate("products", "whlog", "dash");
-  return { itemName: item["Item Name (Standardized)"], newValue: round3(num(item["Current Stock"]) + qty), row: logRow };
+// =================== 🆕 STOCK ENTRY (Warehouse + Manual Purchase) — common logic ===================
+// kind "wh"  → W/H Opening (Full Pack / Loose) mein judta hai, log "Warehouse Entry Log" mein
+// kind "mp"  → Purchase Stock QTy (L) mein judta hai, M = Unit, log "Purchase Orders" (MPO-...) mein
+function readEntryInputs(p, item, role) {
+  const qty = num(p.qty !== undefined ? p.qty : p.newQty);
+  if (!(qty > 0)) throw new Error("Valid quantity daalo");
+  const unit = checkUnit(item, p.unit || item.Unit, role);
+  const rate = money(p.rate);
+  let rateUnit = String(p.rateUnit || "").trim();
+  if (rateUnit) rateUnit = (allowedUnits(item).find(u => normH(u) === normH(rateUnit))) || (role === "Hero" ? rateUnit : (normH(rateUnit) === normH(item["Unit of rate"]) ? item["Unit of rate"] : unit));
+  const expiry = p.expiryDate ? (normalizeDate(p.expiryDate) || "") : "";
+  const vendor = (p.vendor === undefined || p.vendor === null) ? null : String(p.vendor).trim();
+  return { qty, unit, native: toNative(item, qty, unit), rate, rateUnit, expiry, vendor };
 }
-async function handleEditWarehouseEntry(p) {
-  const row = Number(p.logRow); if (!row || row < 2) throw new Error("Invalid row");
-  await writeCell(S.WHLOG, row, 5, Number(p.newQty) || 0);
-  await writeCell(S.WHLOG, row, 9, toISTISO(new Date()));
-  invalidate("whlog", "products", "dash");
-  return { row };
+function extraProductCells(b, C, inp) {
+  const ch = {};
+  if (inp.rate !== "") { if (String(b.Rate) !== String(inp.rate)) ch[C.RATE] = inp.rate; ch[C.RATEUNIT] = inp.rateUnit || b["Unit of rate"] || inp.unit; }
+  if (inp.expiry) ch[C.EXPIRY] = inp.expiry;
+  if (inp.vendor !== null && inp.vendor !== b.Vendor) ch[C.VENDOR] = inp.vendor;
+  return ch;
 }
-async function handleDeleteWarehouseEntry(p) {
-  const row = Number(p.logRow); if (!row || row < 2) throw new Error("Invalid row");
-  await writeCell(S.WHLOG, row, 8, "Cancelled");
-  invalidate("whlog", "products", "dash");
-  return { row };
+function stockDeltaCells(kind, b, C, delta) {
+  if (kind === "wh") return openingCells(b, b["Warehouse Stock Qty Opening STock"] + delta, C);
+  return { [C.PURCHASE]: round3(b["Purchase Stock  QTy"] + delta), [C.PURCHASEUNIT]: b.Unit };
+}
+const MP_HDR = ["PO ID", "Timestamp", "Item Name", "Category", "Unit", "Qty Ordered", "Status", "Requested By", "Notes", "Vendor", "Rate", "Unit of rate", "Expiry Date", "Qty (pcs)", "Last Edited"];
+
+async function addStockEntry(kind, p) {
+  const role = await requireRole(p, ["Supervisor", "Hero"], kind === "wh" ? "Warehouse Stock Entry" : "Purchase entry");
+  if (p.mode === "new" || p.newName) throw new Error("Naya item sirf Hero bana sakta hai (Item Master se).");
+  const item = await findProduct(p.itemName);
+  if (!item) throw new Error(`"${p.itemName}" list mein nahi hai — Hero se item banwao.`);
+  if (isDaily(item["Stock Type"])) throw new Error("Daily-Market item mein stock entry nahi hoti.");
+  const inp = readEntryInputs(p, item, role);
+  const name = item["Item Name (Standardized)"];
+  const { before, after } = await mutateProduct({ name }, (b, C) => Object.assign({}, stockDeltaCells(kind, b, C, inp.native), extraProductCells(b, C, inp)));
+  const ts = toISTISO(new Date());
+  let logRow;
+  if (kind === "wh") {
+    const id = "WH-" + Date.now();
+    logRow = await appendByHeaders(S.WHLOG, {
+      "Log ID": id, "Timestamp": ts, "Item Name": name, "Mode": "add", "Qty": inp.qty, "Unit": inp.unit, "Qty (pcs)": inp.native,
+      "Previous Stock": before["Current Stock"], "Resulting Stock": after["Current Stock"], "Entered By": p.enteredBy || "",
+      "Rate": inp.rate, "Unit of rate": inp.rate !== "" ? (inp.rateUnit || after["Unit of rate"]) : "", "Expiry Date": inp.expiry,
+      "Vendor": after.Vendor, "Status": "Active",
+    }, WH_ALIAS);
+    if (inp.rate !== "") logRateChange(name, before.Rate, inp.rate, inp.rateUnit, "Warehouse entry", p.enteredBy, id);
+    cache.del("whlog");
+  } else {
+    const id = "MPO-" + Date.now();
+    logRow = await appendByHeaders(S.PO, {
+      "PO ID": id, "Timestamp": ts, "Item Name": name, "Category": item.Category || "", "Unit": inp.unit, "Qty Ordered": inp.qty,
+      "Status": "Received (Manual)", "Requested By": p.enteredBy || "", "Notes": "Manual purchase entry", "Vendor": after.Vendor,
+      "Rate": inp.rate, "Unit of rate": inp.rate !== "" ? (inp.rateUnit || after["Unit of rate"]) : "", "Expiry Date": inp.expiry, "Qty (pcs)": inp.native,
+    }, PO_ALIAS);
+    if (inp.rate !== "") logRateChange(name, before.Rate, inp.rate, inp.rateUnit, "Manual purchase", p.enteredBy, id);
+    cache.del("po"); cache.del("mpo"); cache.del("po_batches");
+  }
+  DATA_VER++;
+  return { itemName: name, newValue: after["Current Stock"], unit: after.Unit, row: logRow, product: after };
 }
 
-// =================== CYLINDER HANDLERS ===================
+async function editStockEntry(kind, p, del) {
+  const role = await requireRole(p, ["Supervisor", "Hero"], "Entry edit/delete");
+  const row = Number(kind === "wh" ? (p.logRow || p.row) : (p.row || p.logRow));
+  if (!row || row < 2) throw new Error("Invalid row");
+  const sheet = kind === "wh" ? S.WHLOG : S.PO;
+  const H = kind === "wh" ? WH_HDR : MP_HDR;
+  const qtyKey = kind === "wh" ? "Qty" : "Qty Ordered";
+  return withLock("entry:" + kind + ":" + row, async () => {
+    const e = await readRowByHeaders(sheet, row, H, kind === "wh" ? WH_ALIAS : PO_ALIAS);
+    if (String(e["Status"] || "").trim() === "Cancelled" || String(e["Entered By"] || "").trim() === "Cancelled") throw new Error("Ye entry pehle hi delete ho chuki hai.");
+    if (kind === "mp" && String(e["PO ID"] || "").indexOf("MPO-") !== 0) throw new Error("Ye manual purchase entry nahi hai.");
+    const t = parseIST(normalizeDateTime(e["Timestamp"]));
+    if (role !== "Hero" && !isNaN(t) && Date.now() - t > ENTRY_EDIT_WINDOW_MS + GRACE_MS) throw new Error("1 ghanta ho gaya — entry lock ho chuki hai (sirf Hero badal sakta hai).");
+    const item = await findProduct(e["Item Name"]);
+    if (!item) throw new Error("Item Product Master mein nahi mila: " + e["Item Name"]);
+    const oldNative = (e["Qty (pcs)"] !== undefined && e["Qty (pcs)"] !== "") ? num(e["Qty (pcs)"]) : toNative(item, num(e[qtyKey]), e["Unit"] || item.Unit);
+    const name = item["Item Name (Standardized)"];
+    const nowIso = toISTISO(new Date());
+    if (del) {
+      const { after } = await mutateProduct({ name }, (b, C) => stockDeltaCells(kind, b, C, -oldNative));
+      await writeByHeaders(sheet, row, { "Status": "Cancelled", "Last Edited": nowIso }, kind === "wh" ? WH_ALIAS : PO_ALIAS);
+      invalidate(kind === "wh" ? "whlog" : "mpo", "po", "po_batches");
+      return { row, product: after };
+    }
+    const inp = readEntryInputs(Object.assign({}, p, { unit: p.unit || e["Unit"] || item.Unit }), item, role);
+    const diff = round3(inp.native - oldNative);
+    const { before, after } = await mutateProduct({ name }, (b, C) => Object.assign({}, diff ? stockDeltaCells(kind, b, C, diff) : {}, extraProductCells(b, C, inp)));
+    const upd = { [qtyKey]: inp.qty, "Unit": inp.unit, "Qty (pcs)": inp.native, "Last Edited": nowIso, "Expiry Date": inp.expiry };
+    if (inp.rate !== "") { upd["Rate"] = inp.rate; upd["Unit of rate"] = inp.rateUnit || after["Unit of rate"]; }
+    if (kind === "wh") upd["Resulting Stock"] = after["Current Stock"];
+    if (inp.vendor !== null) upd["Vendor"] = inp.vendor;
+    await writeByHeaders(sheet, row, upd, kind === "wh" ? WH_ALIAS : PO_ALIAS);
+    if (inp.rate !== "") logRateChange(name, before.Rate, inp.rate, inp.rateUnit, kind === "wh" ? "Warehouse entry edit" : "Purchase edit", p.enteredBy || "", e["Log ID"] || e["PO ID"] || "");
+    invalidate(kind === "wh" ? "whlog" : "mpo", "po", "po_batches");
+    return { row, product: after, diff };
+  });
+}
+
+// =================== CYLINDER ===================
 async function handleAddCylinderEntry(p) {
   const qty = Number(p.qty) || 0; if (qty <= 0) throw new Error("Invalid quantity");
   const price = Number(await getSetting("CylinderPrice", "2900")) || 2900;
   const total = qty * price;
-  // userId "cyl_..." se Apps Script photo ko "Peetambra Cylinder Photos" folder mein rakhta hai
   const photoUrl = await uploadPhotoToDrive(p.photoBase64, "cyl_" + Date.now(), "cyl");
   await appendRow(S.CYLINDER, ["CYL-" + Date.now(), toISTISO(new Date()), p.receivedBy || "", qty, price, total, photoUrl]);
   invalidate("cyl", "dash");
@@ -874,13 +1185,19 @@ async function handleAddCylinderEntry(p) {
 
 // =================== PO HANDLERS ===================
 async function handleAddPurchaseOrder(p) {
-  await appendRow(S.PO, ["PO-" + Date.now(), toISTISO(new Date()), p.itemName, p.category || "", p.unit || "", Number(p.qty) || 0, "Pending", p.requestedBy || "", p.notes || ""]);
+  const item = await findProduct(p.itemName);
+  const id = "PO-" + Date.now();
+  await appendByHeaders(S.PO, {
+    "PO ID": id, "Timestamp": toISTISO(new Date()), "Item Name": item ? item["Item Name (Standardized)"] : p.itemName,
+    "Category": p.category || (item && item.Category) || "", "Unit": p.unit || (item && item.Unit) || "", "Qty Ordered": Number(p.qty) || 0,
+    "Status": "Pending", "Requested By": p.requestedBy || "", "Notes": p.notes || "", "Vendor": (item && item.Vendor) || "",
+  }, PO_ALIAS);
   invalidate("po", "po_batches");
-  return { id: "PO-" + Date.now() };
+  return { id };
 }
 async function handleCancelPO(p) {
   const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
-  await writeCell(S.PO, row, 7, "Cancelled");
+  await writeByHeaders(S.PO, row, { "Status": "Cancelled" }, PO_ALIAS);
   invalidate("po", "po_batches");
   return { row };
 }
@@ -888,75 +1205,51 @@ async function handleClearPOBatch(p) {
   const rows = await readRange(S.PO, "A1:ZZ", "FORMATTED_VALUE");
   const headers = rows[0].map(h => String(h).trim());
   const ci = {}; headers.forEach((h, i) => { ci[h] = i; });
-  let cleared = 0;
+  const cells = [];
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
-    if ((r[ci["Vendor"]] || "Unassigned") === p.vendor && (r[ci["Batch ID"]] || "Legacy") === p.batchId && r[ci["Status"]] === "Generated") {
-      await writeCell(S.PO, i + 1, ci["Status"] + 1, "Cleared"); cleared++;
-    }
+    if ((r[ci["Vendor"]] || "Unassigned") === p.vendor && (r[ci["Batch ID"]] || "Legacy") === p.batchId && r[ci["Status"]] === "Generated") cells.push({ row: i + 1, col: ci["Status"] + 1, value: "Cleared" });
   }
+  await batchWrite(S.PO, cells);
   invalidate("po", "po_batches");
-  return { cleared };
+  return { cleared: cells.length };
 }
 async function handleGeneratePOBatch(p) {
   const rows = await readRange(S.PO, "A1:ZZ", "FORMATTED_VALUE");
   const headers = rows[0].map(h => String(h).trim());
   const ci = {}; headers.forEach((h, i) => { ci[h] = i; });
   const selected = Array.isArray(p.rows) ? p.rows.map(Number) : [];
-  let itemCount = 0, remainingPending = 0;
+  const cells = []; let remainingPending = 0;
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
-    const matchVendor = (r[ci["Vendor"]] || "Unassigned") === p.vendor;
-    const matchBatch = (r[ci["Batch ID"]] || "Legacy") === p.batchId;
-    const isPending = (r[ci["Status"]] === "Pending");
-    if (matchVendor && matchBatch && isPending) {
-      if (selected.length === 0 || selected.indexOf(i + 1) !== -1) {
-        await writeCell(S.PO, i + 1, ci["Status"] + 1, "Generated"); itemCount++;
-      } else remainingPending++;
+    if (String(r[ci["PO ID"]] || "").indexOf("MPO-") === 0) continue;
+    if ((r[ci["Vendor"]] || "Unassigned") === p.vendor && (r[ci["Batch ID"]] || "Legacy") === p.batchId && r[ci["Status"]] === "Pending") {
+      if (selected.length === 0 || selected.indexOf(i + 1) !== -1) cells.push({ row: i + 1, col: ci["Status"] + 1, value: "Generated" });
+      else remainingPending++;
     }
   }
+  await batchWrite(S.PO, cells);
   invalidate("po", "po_batches");
-  return { itemCount, remainingPending, pdfUrl: "" };
+  return { itemCount: cells.length, remainingPending, pdfUrl: "" };
 }
 async function handleAutoTagVendors() {
-  const products = await cached("products", readProducts);
-  let tagged = 0;
-  for (const p of products) {
-    if (String(p.Vendor || "").trim()) continue;
-    const m = matchVendorForItem(p["Item Name (Standardized)"]);
-    if (m) { await writeCell(S.PRODUCTS, p._row, 16, m); tagged++; }
-  }
-  invalidate("products");
-  return { tagged, total: products.length };
+  return withLock("products", async () => {
+    const C = await getProdCols();
+    cache.del("products");
+    const products = await cached("products", readProducts);
+    const cells = [];
+    products.forEach(p => {
+      if (String(p.Vendor || "").trim()) return;
+      const m = matchVendorForItem(p["Item Name (Standardized)"]);
+      if (m) cells.push({ row: p._row, col: C.VENDOR + 1, value: m });
+    });
+    await batchWrite(S.PRODUCTS, cells);
+    invalidate("products", "vendors");
+    return { tagged: cells.length, total: products.length };
+  });
 }
 
-// =================== MANUAL PURCHASE HANDLERS ===================
-async function handleAddManualPurchase(p) {
-  // 🆕 Naya item ho to pehle Product Master mein bana do
-  const { item } = await findOrCreateProduct(p);
-  const qty = Number(p.qty) || 0; if (qty <= 0) throw new Error("Invalid quantity");
-  const newPurchase = round3(num(item["Purchase Stock  QTy"]) + qty);
-  await writeCell(S.PRODUCTS, item._row, 11, newPurchase);
-  if (p.rate) await writeCell(S.PRODUCTS, item._row, 17, Number(p.rate));
-  if (p.expiryDate) await writeCell(S.PRODUCTS, item._row, 19, p.expiryDate);
-  await appendRow(S.PO, ["MPO-" + Date.now(), toISTISO(new Date()), item["Item Name (Standardized)"], p.category || item.Category || "", p.unit || item.Unit || "", qty, "Received (Manual)", p.enteredBy || "", "Manual purchase entry"]);
-  invalidate("products", "po", "dash", "mpo");
-  return { itemName: item["Item Name (Standardized)"], newValue: round3(num(item["Current Stock"]) + qty) };
-}
-async function handleEditManualPurchase(p) {
-  const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
-  await writeCell(S.PO, row, 6, Number(p.newQty) || 0);
-  invalidate("po", "mpo", "products", "dash");
-  return { row };
-}
-async function handleDeleteManualPurchase(p) {
-  const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
-  await writeCell(S.PO, row, 7, "Cancelled");
-  invalidate("po", "mpo", "products", "dash");
-  return { row };
-}
-
-// =================== STAFF HANDLERS ===================
+// =================== STAFF ===================
 async function handleAddStaff(p) {
   const staff = await cached("staff", readStaff);
   const userId = p.userId || (String(p.name).replace(/\s+/g, "") + "-" + String(staff.length + 1).padStart(3, "0"));
@@ -966,37 +1259,120 @@ async function handleAddStaff(p) {
 }
 async function handleUpdateStaff(p) {
   const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
-  await writeCell(S.STAFF, row, 1, p.name);
-  await writeCell(S.STAFF, row, 2, p.designation);
-  await writeCell(S.STAFF, row, 3, p.shift);
-  await writeCell(S.STAFF, row, 4, p.userId);
-  await writeCell(S.STAFF, row, 5, p.permission);
-  await writeCell(S.STAFF, row, 6, p.password);
+  await batchWrite(S.STAFF, [
+    { row, col: 1, value: p.name }, { row, col: 2, value: p.designation }, { row, col: 3, value: p.shift },
+    { row, col: 4, value: p.userId }, { row, col: 5, value: p.permission }, { row, col: 6, value: p.password },
+  ]);
   invalidate("staff", "dash");
   return { row };
 }
 async function handleDeleteStaff(p) {
   const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
   try {
-    const sh = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
-    const sheetId = sh.data.sheets.find(s => s.properties.title === S.STAFF)?.properties.sheetId;
+    const m = await sheetMeta();
+    const sheetId = m[S.STAFF] && m[S.STAFF].sheetId;
     if (sheetId !== undefined) {
       await sheets.spreadsheets.batchUpdate({
         spreadsheetId: SHEET_ID,
         requestBody: { requests: [{ deleteDimension: { range: { sheetId, dimension: "ROWS", startIndex: row - 1, endIndex: row } } }] },
       });
     }
-  } catch (e) {}
+  } catch (e) { console.error("Delete staff:", e.message); }
   invalidate("staff", "dash");
   return { deleted: row };
 }
+
+// =================== 🆕 HERO — ITEM CREATE / UPDATE (Product & Stock Master ka har column) ===================
+async function copyStockFormulas(rowNum, C) {
+  try {
+    if (rowNum < 3) return;
+    const src = rowNum - 1;
+    const lo = Math.min(C.CURCARTON, C.CURPCS), hi = Math.max(C.CURCARTON, C.CURPCS);
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `'${S.PRODUCTS}'!${colLetter(lo + 1)}${src}:${colLetter(hi + 1)}${src}`, valueRenderOption: "FORMULA" });
+    const v = (res.data.values || [])[0] || [];
+    if (!v.some(x => typeof x === "string" && x.trim().startsWith("="))) return; // ARRAYFORMULA ya value — copy ki zaroorat nahi
+    const m = await sheetMeta();
+    const sid = m[S.PRODUCTS].sheetId;
+    await sheets.spreadsheets.batchUpdate({ spreadsheetId: SHEET_ID, requestBody: { requests: [{ copyPaste: {
+      source: { sheetId: sid, startRowIndex: src - 1, endRowIndex: src, startColumnIndex: lo, endColumnIndex: hi + 1 },
+      destination: { sheetId: sid, startRowIndex: rowNum - 1, endRowIndex: rowNum, startColumnIndex: lo, endColumnIndex: hi + 1 },
+      pasteType: "PASTE_FORMULA" } }] } });
+  } catch (e) { console.error("Formula copy:", e.message); }
+}
+function heroVals(f, unit) {
+  return {
+    CAT: String(f.category || "").trim(), PACK: f.packaging === undefined ? undefined : String(f.packaging).trim(),
+    OPENFULL: f.openFull === undefined ? undefined : num(f.openFull), OPENLOOSE: f.openLoose === undefined ? undefined : num(f.openLoose),
+    DEMAND: f.demand === undefined ? undefined : num(f.demand), APPROVED: f.approved === undefined ? undefined : num(f.approved),
+    PURCHASE: f.purchase === undefined ? undefined : num(f.purchase),
+    DEMANDUNIT: unit, APPROVEDUNIT: unit, PURCHASEUNIT: unit, UNIT: unit,
+    MIN: f.min === undefined ? undefined : (String(f.min).trim() === "" ? "" : num(f.min)),
+    MAX: f.max === undefined ? undefined : (String(f.max).trim() === "" ? "" : num(f.max)),
+    VENDOR: f.vendor === undefined ? undefined : String(f.vendor).trim(),
+    RATE: f.rate === undefined ? undefined : money(f.rate),
+    RATEUNIT: f.rateUnit === undefined ? undefined : (String(f.rateUnit).trim() || unit),
+    EXPIRY: f.expiry === undefined ? undefined : (f.expiry ? (normalizeDate(f.expiry) || String(f.expiry)) : ""),
+    BASEUNIT: f.baseUnit === undefined ? undefined : (String(f.baseUnit).trim() || unit),
+    SUQ: f.suq === undefined ? undefined : (num(f.suq) || 1),
+    STOCKTYPE: f.stockType === undefined ? undefined : (isDaily(f.stockType) ? "Daily Market" : "Stocked"),
+  };
+}
+async function heroCreateProduct(f, by) {
+  const out = await withLock("products", async () => {
+    const C = await getProdCols();
+    cache.del("products");
+    const list = await cached("products", readProducts);
+    if (list.find(x => normH(x["Item Name (Standardized)"]) === normH(f.name))) throw new Error("Ye item pehle se hai: " + f.name);
+    const unit = f.unit;
+    const vals = heroVals(Object.assign({ openFull: 0, openLoose: 0, demand: 0, approved: 0, purchase: 0, baseUnit: unit, suq: 1, stockType: "Stocked", rateUnit: unit }, f), unit);
+    const maxIdx = Math.max(...Object.values(C));
+    const arr = new Array(maxIdx + 1).fill("");
+    arr[C.SNO] = "=ROW()-1"; // sheet jaisa hi S no formula
+    arr[C.NAME] = f.name;
+    Object.keys(vals).forEach(k => { if (vals[k] !== undefined && C[k] !== undefined) arr[C[k]] = vals[k]; });
+    arr[C.CURCARTON] = null; arr[C.CURPCS] = null; // formula columns — chhod do
+    const rowNum = await appendRow(S.PRODUCTS, arr);
+    await copyStockFormulas(rowNum, C);
+    cache.del("products"); DATA_VER++; cache.del("dash"); cache.del("vendors");
+    const fresh = (await cached("products", readProducts)).find(x => x._row === rowNum) || null;
+    return { fresh, rate: vals.RATE, rateUnit: vals.RATEUNIT };
+  });
+  if (out.rate !== "" && out.rate !== undefined) logRateChange(f.name, "", out.rate, out.rateUnit, "Hero: naya item", by, "");
+  return out.fresh || await findProduct(f.name);
+}
+async function handleHeroSaveProduct(p) {
+  await requireRole(p, ["Hero"], "Item create/update");
+  const st = await staffOf(p);
+  const by = st ? st.Name : "Hero";
+  const f = p.fields || {};
+  const name = String(f.name || "").trim(), category = String(f.category || "").trim(), unit = String(f.unit || "").trim();
+  if (!name) throw new Error("Item ka naam likho");
+  if (!category || !unit) throw new Error("Category aur Unit dono zaroori hain");
+  if (f.suq !== undefined && !(num(f.suq) > 0)) throw new Error("1 Base Unit = qty 0 se zyada honi chahiye");
+  const ff = Object.assign({}, f, { name, category, unit });
+  if (!p.row) return { product: await heroCreateProduct(ff, by), created: true };
+
+  const list = await cached("products", readProducts);
+  const clash = list.find(x => normH(x["Item Name (Standardized)"]) === normH(name) && x._row !== Number(p.row));
+  if (clash) throw new Error("Is naam ka item pehle se hai (row " + clash._row + ")");
+  const res = await mutateProduct({ row: Number(p.row) }, (b, C) => {
+    if (p.originalName && normH(b["Item Name (Standardized)"]) !== normH(p.originalName)) throw new Error("Sheet mein ye row badal gayi hai — page refresh karke dobara try karo.");
+    const ch = { [C.NAME]: name };
+    const vals = heroVals(ff, unit);
+    Object.keys(vals).forEach(k => { if (vals[k] !== undefined && C[k] !== undefined) ch[C[k]] = vals[k]; });
+    return ch;
+  });
+  const newRate = money(f.rate);
+  if (f.rate !== undefined && newRate !== "" && String(res.before.Rate) !== String(newRate)) logRateChange(name, res.before.Rate, newRate, res.after["Unit of rate"], "Hero update", by, "");
+  cache.del("vendors");
+  return { product: res.after };
+}
 async function handleAddProduct(p) {
-  const products = await cached("products", readProducts);
-  if (products.find(x => normH(x["Item Name (Standardized)"]) === normH(p.name))) throw new Error("Item already exists");
-  const suq = Number(p.stockUnitQty) || 1;
-  const rowNum = await appendRow(S.PRODUCTS, [products.length + 1, p.name, p.category || "", p.packaging || "", p.unit || "", 0, 0, 0, p.demandUnit || p.unit || "", 0, 0, "", "", Number(p.minStock) || 0, Number(p.maxStock) || 0, "", "", p.unit || "", "", p.baseUnit || p.unit || "", suq, p.stockType || "Stocked"]);
-  invalidate("products", "dash");
-  return { added: p.name, row: rowNum };
+  // purana action — ab sirf Hero
+  return handleHeroSaveProduct(Object.assign({}, p, { row: null, fields: {
+    name: p.name, category: p.category, unit: p.unit, packaging: p.packaging, min: p.minStock, max: p.maxStock,
+    baseUnit: p.baseUnit, suq: p.stockUnitQty, stockType: p.stockType,
+  } }));
 }
 async function handleAddVendor(p) {
   const name = String(p.name || "").trim(); if (!name) throw new Error("Vendor name khali hai");
@@ -1007,17 +1383,13 @@ async function handleAddVendor(p) {
   return { name, added: true };
 }
 async function handleSetProductVendor(p) {
-  const products = await cached("products", readProducts);
-  const item = products.find(x => normH(x["Item Name (Standardized)"]) === normH(p.itemName));
-  if (!item) throw new Error("Item not found");
-  await writeCell(S.PRODUCTS, item._row, 16, p.vendor || "");
-  invalidate("products");
-  return { itemName: p.itemName, vendor: p.vendor };
+  const { after } = await mutateProduct({ name: p.itemName }, (b, C) => ({ [C.VENDOR]: String(p.vendor || "").trim() }));
+  return { itemName: p.itemName, vendor: p.vendor, product: after };
 }
 
 // =================== PO BATCHES ===================
 async function readPOBatches() {
-  const pos = (await cached("po", readPO)).filter(po => po.Status !== "Cancelled");
+  const pos = (await cached("po", readPO)).filter(po => po.Status !== "Cancelled" && String(po["PO ID"] || "").indexOf("MPO-") !== 0 && String(po.Status || "").indexOf("Received") !== 0);
   const batches = {};
   pos.forEach(po => {
     const vendor = po.Vendor || "Unassigned"; const batchId = po["Batch ID"] || "Legacy";
@@ -1037,7 +1409,6 @@ async function readPOBatches() {
 }
 
 // =================== ACTION DISPATCHER ===================
-// Saare actions yahin se chalte hain. Router isko seedha ya _rid guard ke through call karta hai.
 async function dispatchAction(action, payload) {
   let data;
   if (action === "login") data = await handleLogin(payload);
@@ -1049,20 +1420,17 @@ async function dispatchAction(action, payload) {
   else if (action === "getVendors") data = await cached("vendors", readVendors);
   else if (action === "getDemands") data = await cached("demands", readDemands);
   else if (action === "getDashboardStats") data = await buildDashboardStats();
+  else if (action === "getRateHistory") data = await cached("ratehist", readRateHistory);
   else if (action === "getLowStockAlerts") {
     const products = await cached("products", readProducts);
-    // 🔧 FIX: Compare against Current Stock (pcs), not carton
     data = products.filter(p => {
+      if (isDaily(p["Stock Type"])) return false;
       const min = num(p.Min), max = num(p.Max), cur = num(p["Current Stock"]);
       return (min > 0 && cur <= min) || (max > 0 && cur >= max);
     }).map(p => ({
-      "Item Name": p["Item Name (Standardized)"],
-      Category: p.Category,
-      Unit: p.Unit,
-      "Current Stock": p["Current Stock"],
-      "Min Stock": p.Min,
-      "Max Stock": p.Max,
-      "Status": (num(p.Min) > 0 && num(p["Current Stock"]) <= num(p.Min)) ? "LOW" : "OVERSTOCK"
+      "Item Name": p["Item Name (Standardized)"], Category: p.Category, Unit: p.Unit,
+      "Current Stock": p["Current Stock"], "Min Stock": p.Min, "Max Stock": p.Max,
+      "Status": (num(p.Min) > 0 && num(p["Current Stock"]) <= num(p.Min)) ? "LOW" : "OVERSTOCK",
     }));
   }
   else if (action === "getWarehouseEntries") data = await cached("whlog", readWarehouseEntries);
@@ -1076,13 +1444,17 @@ async function dispatchAction(action, payload) {
     if (payload.userId) att = att.filter(r => String(r["User ID"]).toLowerCase().trim() === String(payload.userId).toLowerCase().trim());
     data = att;
   }
+  else if (action === "heroSaveProduct") data = await handleHeroSaveProduct(payload);
   else if (action === "addProduct") data = await handleAddProduct(payload);
-  else if (action === "addWarehouseEntry") data = await handleAddWarehouseEntry(payload);
-  else if (action === "editWarehouseEntry") data = await handleEditWarehouseEntry(payload);
-  else if (action === "deleteWarehouseEntry") data = await handleDeleteWarehouseEntry(payload);
+  else if (action === "addWarehouseEntry") data = await addStockEntry("wh", payload);
+  else if (action === "editWarehouseEntry") data = await editStockEntry("wh", payload, false);
+  else if (action === "deleteWarehouseEntry") data = await editStockEntry("wh", payload, true);
+  else if (action === "addManualPurchase") data = await addStockEntry("mp", payload);
+  else if (action === "editManualPurchase") data = await editStockEntry("mp", payload, false);
+  else if (action === "deleteManualPurchase") data = await editStockEntry("mp", payload, true);
   else if (action === "addDemand") data = await handleAddDemand(payload);
   else if (action === "approveDemands") data = await handleApproveDemands(payload);
-  else if (action === "approveDemand") data = await handleApproveDemands({ ...payload, items: [{ row: payload.row, approvedQty: payload.approvedQty, feedback: payload.feedback, unit: payload.unit }] });
+  else if (action === "approveDemand") data = await handleApproveDemands({ ...payload, items: [{ row: payload.row, approvedQty: payload.approvedQty, feedback: payload.feedback, unit: payload.unit, rate: payload.rate, amount: payload.amount }] });
   else if (action === "rejectDemands") data = await handleRejectDemands(payload);
   else if (action === "rejectDemand") data = await handleRejectDemands({ ...payload, rows: [payload.row] });
   else if (action === "editDemand") data = await handleEditDemand(payload);
@@ -1093,9 +1465,6 @@ async function dispatchAction(action, payload) {
   else if (action === "clearPOBatch") data = await handleClearPOBatch(payload);
   else if (action === "generatePOBatch") data = await handleGeneratePOBatch(payload);
   else if (action === "autoTagVendors") data = await handleAutoTagVendors();
-  else if (action === "addManualPurchase") data = await handleAddManualPurchase(payload);
-  else if (action === "editManualPurchase") data = await handleEditManualPurchase(payload);
-  else if (action === "deleteManualPurchase") data = await handleDeleteManualPurchase(payload);
   else if (action === "addVendor") data = await handleAddVendor(payload);
   else if (action === "setProductVendor") data = await handleSetProductVendor(payload);
   else if (action === "markAttendance") data = await handleMarkAttendance(payload);
@@ -1105,13 +1474,9 @@ async function dispatchAction(action, payload) {
   else if (action === "addStaff") data = await handleAddStaff(payload);
   else if (action === "updateStaff") data = await handleUpdateStaff(payload);
   else if (action === "deleteStaff") data = await handleDeleteStaff(payload);
-  // 🆕 AUTO-PO actions
   else if (action === "runAutoPO") data = await runAutoPOForAll();
   else if (action === "checkAutoPOForItem") data = await checkAndCreateAutoPO(payload.itemName);
-  else if (action === "uploadPhoto") {
-    const url = await uploadPhotoToDrive(payload.photoBase64, payload.userId || "photo", payload.name || "photo");
-    data = { url };
-  }
+  else if (action === "uploadPhoto") data = { url: await uploadPhotoToDrive(payload.photoBase64, payload.userId || "photo", payload.name || "photo") };
   else data = { note: "Action not implemented yet: " + action };
   return data;
 }
@@ -1122,25 +1487,18 @@ app.all("/", async (req, res) => {
   const action = payload.action;
   if (!action) return res.json({ ok: true, service: "Peetambra Bridge Running" });
   try {
-    // 🆕 Sirf write actions par _rid guard lagta hai (read actions par nahi)
     const isRead = /^get/.test(action) || action === "poll" || action === "login" || action === "bootstrap";
     const rid = (!isRead && payload._rid) ? (action + ":" + String(payload._rid)) : "";
-
     let data;
     if (rid) {
       let entry = ridStore.get(rid);
       if (!entry) {
         entry = { t: Date.now(), promise: dispatchAction(action, payload) };
         ridStore.set(rid, entry);
-        // Fail hua to _rid hata do, taaki retry sach mein dobara try kare
         entry.promise.catch(() => { if (ridStore.get(rid) === entry) ridStore.delete(rid); });
-      } else {
-        console.log("Duplicate request blocked:", action, payload._rid);
-      }
+      } else console.log("Duplicate request blocked:", action, payload._rid);
       data = await entry.promise;
-    } else {
-      data = await dispatchAction(action, payload);
-    }
+    } else data = await dispatchAction(action, payload);
     res.json({ ok: true, data });
   } catch (e) {
     console.error("Router error on", action, ":", e.message);
@@ -1151,4 +1509,9 @@ app.all("/", async (req, res) => {
 app.get("/", (req, res) => res.json({ ok: true, service: "Peetambra Bridge Running" }));
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("🚀 Bridge running on port " + PORT));
+app.listen(PORT, () => {
+  console.log("🚀 Bridge running on port " + PORT);
+  // Server start hote hi Product Master + Demand headers ready
+  cached("products", readProducts).then(() => console.log("Product columns:", JSON.stringify(PCOL))).catch(e => console.error("Warmup:", e.message));
+  ensureDemandHeaders();
+});
