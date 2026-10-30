@@ -672,7 +672,17 @@ async function checkAndCreateAutoPO(itemName) {
     if (!item || isDaily(item["Stock Type"])) return null;
     const min = num(item.Min), max = num(item.Max), cur = num(item["Current Stock"]);
     if (min <= 0 || cur > min) return null;
-    const orderQty = max > min ? Math.max(1, round3(max - cur)) : Math.max(1, round3(min * 2 - cur));
+    // Zaroorat "Unit" (chhota, jaise pcs) mein nikalti hai, phir jitne poore carton/pkt (Base Unit) banein
+    // utne hi auto PO mein jaate hain. Baaki (loose) hissa supervisor PO mein "Add-on" se jodta hai.
+    const needNative = max > min ? Math.max(1, round3(max - cur)) : Math.max(1, round3(min * 2 - cur));
+    const nativeUnit = String(item.Unit || "").trim();
+    const baseUnit = String(item["Base Unit"] || "").trim();
+    const suq = num(item["1 Stock Unit = (Base Qty)"]) || 1;
+    let orderQty = needNative, orderUnit = nativeUnit;
+    if (baseUnit && normH(baseUnit) !== normH(nativeUnit) && suq > 1) {
+      orderQty = Math.max(1, Math.floor(needNative / suq + 1e-9)); // kam se kam 1 carton
+      orderUnit = baseUnit;
+    }
     cache.del("po");
     const pos = await cached("po", readPO);
     const existing = pos.find(p => normH(p["Item Name"]) === normH(itemName) && String(p.Status || "").trim() === "Pending");
@@ -681,11 +691,11 @@ async function checkAndCreateAutoPO(itemName) {
     const vendor = item.Vendor || "Unassigned";
     await appendByHeaders(S.PO, {
       "PO ID": poId, "Timestamp": toISTISO(new Date()), "Item Name": item["Item Name (Standardized)"], "Category": item.Category || "",
-      "Unit": item.Unit || "", "Qty Ordered": orderQty, "Status": "Pending", "Requested By": "AUTO-PO",
-      "Notes": `Auto: Stock ${cur} <= Min ${min}`, "Vendor": vendor,
+      "Unit": orderUnit, "Qty Ordered": orderQty, "Auto Qty": orderQty, "Status": "Pending", "Requested By": "AUTO-PO",
+      "Notes": `Auto: Stock ${cur} <= Min ${min} (need ${needNative} ${nativeUnit})`, "Vendor": vendor,
     }, PO_ALIAS);
     invalidate("po", "po_batches", "mpo", "dash");
-    return { created: true, poId, itemName: item["Item Name (Standardized)"], qty: orderQty, current: cur, min, max, vendor };
+    return { created: true, poId, itemName: item["Item Name (Standardized)"], qty: orderQty, unit: orderUnit, current: cur, min, max, vendor };
   });
 }
 async function runAutoPOForAll() {
@@ -1204,14 +1214,45 @@ async function handleAddCylinderEntry(p) {
 // =================== PO HANDLERS ===================
 async function handleAddPurchaseOrder(p) {
   const item = await findProduct(p.itemName);
+  const qty = Number(p.qty) || 0; if (qty <= 0) throw new Error("Quantity 0 se zyada honi chahiye");
+  // Unit sirf item ke apne unit (Unit / Base Unit) mein se hi — naya unit yahan se nahi ban sakta (sirf Hero item master se)
+  const unit = item ? checkUnit(item, p.unit, "") : (p.unit || "");
   const id = "PO-" + Date.now();
   await appendByHeaders(S.PO, {
     "PO ID": id, "Timestamp": toISTISO(new Date()), "Item Name": item ? item["Item Name (Standardized)"] : p.itemName,
-    "Category": p.category || (item && item.Category) || "", "Unit": p.unit || (item && item.Unit) || "", "Qty Ordered": Number(p.qty) || 0,
+    "Category": p.category || (item && item.Category) || "", "Unit": unit, "Qty Ordered": qty,
     "Status": "Pending", "Requested By": p.requestedBy || "", "Notes": p.notes || "", "Vendor": (item && item.Vendor) || "",
+    "Item Note": String(p.itemNote || "").trim().slice(0, 200),
   }, PO_ALIAS);
   invalidate("po", "po_batches");
   return { id };
+}
+// PO item par Add-on qty (auto qty ke upar extra) aur Note — Pending / Generated dono par chalta hai
+async function handleUpdatePOItem(p) {
+  const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
+  const cur = await readRowByHeaders(S.PO, row, ["PO ID", "Item Name", "Status", "Unit"], PO_ALIAS);
+  if (!cur["PO ID"]) throw new Error("PO row nahi mili");
+  if (String(cur["PO ID"]).indexOf("MPO-") === 0) throw new Error("Manual purchase yahan edit nahi hota");
+  const st = String(cur.Status || "").trim();
+  if (st !== "Pending" && st !== "Generated") throw new Error((st || "Ye") + " PO item edit nahi ho sakta");
+  const upd = {};
+  if (p.addonQty !== undefined) {
+    const q = Number(p.addonQty) || 0;
+    if (q < 0) throw new Error("Add-on qty negative nahi ho sakti");
+    let u = "";
+    if (q > 0) {
+      u = String(p.addonUnit || "").trim() || String(cur.Unit || "").trim();
+      const item = await findProduct(cur["Item Name"]);
+      if (item) u = checkUnit(item, u, "");
+    }
+    upd["Add-on Qty"] = q > 0 ? round3(q) : "";
+    upd["Add-on Unit"] = u;
+  }
+  if (p.itemNote !== undefined) upd["Item Note"] = String(p.itemNote || "").trim().slice(0, 200);
+  if (!Object.keys(upd).length) throw new Error("Kuch badla nahi");
+  await writeByHeaders(S.PO, row, upd, PO_ALIAS);
+  invalidate("po", "po_batches");
+  return { row, addonQty: upd["Add-on Qty"] === undefined ? undefined : upd["Add-on Qty"], addonUnit: upd["Add-on Unit"], itemNote: upd["Item Note"] };
 }
 async function handleCancelPO(p) {
   const row = Number(p.row); if (!row || row < 2) throw new Error("Invalid row");
@@ -1413,7 +1454,7 @@ async function readPOBatches() {
     const vendor = po.Vendor || "Unassigned"; const batchId = po["Batch ID"] || "Legacy";
     const key = vendor + "|" + batchId;
     if (!batches[key]) batches[key] = { vendor, batchId, items: [], pdfUrl: "" };
-    batches[key].items.push({ row: po._row, name: po["Item Name"], unit: po.Unit, qty: po["Qty Ordered"], status: po.Status, timestamp: po.Timestamp });
+    batches[key].items.push({ row: po._row, name: po["Item Name"], unit: po.Unit, qty: po["Qty Ordered"], autoQty: po["Auto Qty"] === undefined ? "" : po["Auto Qty"], addonQty: po["Add-on Qty"] === undefined ? "" : po["Add-on Qty"], addonUnit: po["Add-on Unit"] || "", note: po["Item Note"] || "", status: po.Status, timestamp: po.Timestamp });
     if (po["PDF URL"]) batches[key].pdfUrl = po["PDF URL"];
   });
   const list = Object.values(batches).filter(b => b.items.length);
@@ -1600,6 +1641,7 @@ async function dispatchAction(action, payload) {
   else if (action === "deleteDemand") data = await handleDeleteDemand(payload);
   else if (action === "saveDemandFeedback") data = await handleSaveDemandFeedback(payload);
   else if (action === "addPurchaseOrder") data = await handleAddPurchaseOrder(payload);
+  else if (action === "updatePOItem") data = await handleUpdatePOItem(payload);
   else if (action === "cancelPO") data = await handleCancelPO(payload);
   else if (action === "clearPOBatch") data = await handleClearPOBatch(payload);
   else if (action === "generatePOBatch") data = await handleGeneratePOBatch(payload);
