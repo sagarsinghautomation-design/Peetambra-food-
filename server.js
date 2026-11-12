@@ -1,4 +1,4 @@
-aconst express = require("express");
+const express = require("express");
 const { google } = require("googleapis");
 const NodeCache = require("node-cache");
 const cors = require("cors");
@@ -1494,7 +1494,7 @@ async function handleSendMessage(p) {
   if (!text) throw new Error("Message khali hai");
   const staff = await cached("staff", readStaff);
   let to = Array.isArray(p.to) ? p.to.map(x => String(x).toLowerCase().trim()) : [];
-  const list = staff.filter(s => String(s.User || "").trim() && String(s.User).toLowerCase().trim() !== String(me.User).toLowerCase().trim() && (p.toAll || to.includes(String(s.User).toLowerCase().trim())));
+  const list = staff.filter(s => String(s.User || "").trim() && String(s.Permission || "").trim() !== "Viewer" && String(s.User).toLowerCase().trim() !== String(me.User).toLowerCase().trim() && (p.toAll || to.includes(String(s.User).toLowerCase().trim())));
   if (!list.length) throw new Error("Kam se kam ek staff chuno");
   await ensureSheet(S.MSG, MSG_HDR);
   const ts = toISTISO(new Date());
