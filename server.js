@@ -23,6 +23,7 @@ const S = {
   PRODUCTS: "Product & Stock Master", ATTENDANCE: "Attendance", DEMAND: "Demand",
   PO: "Purchase Orders", STAFF: "Staff", WHLOG: "Warehouse Entry Log",
   CYLINDER: "Cylinder Entry", SETTINGS: "Settings", RATEHIST: "Rate History", MSG: "Messages", COMPLAINT: "Complaints",
+  PPDAY: "Petpooja Daily Sales", PPORD: "Petpooja Orders",
 };
 
 // =================== HELPERS ===================
@@ -1581,6 +1582,332 @@ async function handleUpdateComplaint(p) {
   return { row, status: p.status || r[7], reply };
 }
 
+// =================== 🆕 PETPOOJA SALES (POS + Zomato + Swiggy — sab orders) ===================
+// Petpooja ka "generic_get_orders" API: ek din ke saare bills (Dine-in, Takeaway, Delivery, Zomato, Swiggy).
+// Credentials Petpooja support deta hai (app_key, app_secret, access_token, restID) — Render env mein daalo:
+//   PP_APP_KEY, PP_APP_SECRET, PP_ACCESS_TOKEN, PP_REST_ID   (zaroori)
+//   PP_COOKIE (agar Petpooja ne diya ho), PP_SYNC_KEY (cron/webhook ka password), PP_POLL_MS (default 120000)
+// Note: Petpooja GET-with-body ko ab 403 deta hai — isliye POST bhejte hain (same JSON body).
+// Note: date D maangne par D aur D-1 dono ke bills aate hain — hum order ki apni date se filter karte hain.
+const PP = {
+  URL: process.env.PP_API_URL || "https://api.petpooja.com/V1/thirdparty/generic_get_orders/",
+  APP_KEY: (process.env.PP_APP_KEY || "").trim(),
+  APP_SECRET: (process.env.PP_APP_SECRET || "").trim(),
+  ACCESS_TOKEN: (process.env.PP_ACCESS_TOKEN || "").trim(),
+  REST_ID: (process.env.PP_REST_ID || "").trim(),
+  COOKIE: (process.env.PP_COOKIE || "").trim(),
+  SYNC_KEY: (process.env.PP_SYNC_KEY || "").trim(),
+  POLL_MS: Math.max(60000, Number(process.env.PP_POLL_MS) || 120000),
+};
+const PP_STATE = { lastSyncAt: "", lastSyncDate: "", lastError: "", lastErrorAt: "", lastOkAt: "", webhookHits: 0, lastWebhookAt: "", webhookSamples: [] };
+const PP_SALES_ROLES = ["Admin", "Hero"];
+function ppConfigured() { return !!(PP.APP_KEY && PP.APP_SECRET && PP.ACCESS_TOKEN && PP.REST_ID); }
+function istTodayISO(offsetDays) { const d = new Date(Date.now() + 5.5 * 3600000 + (offsetDays || 0) * 86400000); return d.toISOString().slice(0, 10); }
+function istHour() { return new Date(Date.now() + 5.5 * 3600000).getUTCHours(); }
+function addDaysISO(iso, n) { const d = new Date(iso + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+
+// --- 1) Petpooja API call (retry + timeout) ---
+async function ppCall(dateISO) {
+  if (!ppConfigured()) throw new Error("Petpooja connect nahi hai — Render env mein PP_APP_KEY, PP_APP_SECRET, PP_ACCESS_TOKEN, PP_REST_ID daalo.");
+  const body = JSON.stringify({ app_key: PP.APP_KEY, app_secret: PP.APP_SECRET, access_token: PP.ACCESS_TOKEN, restID: PP.REST_ID, order_date: dateISO, refId: "" });
+  const headers = { "Content-Type": "application/json" };
+  if (PP.COOKIE) headers.Cookie = PP.COOKIE;
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
+    try {
+      const r = await fetch(PP.URL, { method: "POST", headers, body, signal: controller.signal });
+      const txt = await r.text();
+      let j;
+      try { j = JSON.parse(txt); } catch (e) { throw Object.assign(new Error(`Petpooja ne JSON nahi diya (HTTP ${r.status}): ${txt.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").slice(0, 140)}`), { retry: r.status >= 500 || r.status === 429 }); }
+      const okFlag = String(j.success) === "1" || j.success === true;
+      if (!okFlag) {
+        const msg = String(j.message || j.msg || j.error || ("code " + j.code));
+        // order hi nahi hain → khali din, error nahi
+        if (/no\s*(record|order|data)|not\s*found/i.test(msg)) return [];
+        const fatal = /token|invalid|mapp|not\s*enabled|auth|unauthori|restaurant|app.?key|secret/i.test(msg);
+        throw Object.assign(new Error("Petpooja: " + msg), { retry: !fatal });
+      }
+      return Array.isArray(j.order_json) ? j.order_json : (Array.isArray(j.orders) ? j.orders : []);
+    } catch (e) {
+      lastErr = e.name === "AbortError" ? Object.assign(new Error("Petpooja ne 30 sec mein jawab nahi diya"), { retry: true }) : e;
+      if (lastErr.retry === false) break;
+      if (attempt < 2) await new Promise(res => setTimeout(res, 800 * Math.pow(2, attempt)));
+    } finally { clearTimeout(timer); }
+  }
+  throw lastErr;
+}
+
+// --- 2) Raw order → saaf object (field naam alag ho to bhi chale) ---
+function ppPick(o, keys) {
+  if (!o || typeof o !== "object") return undefined;
+  for (const k of keys) { const v = o[k]; if (v !== undefined && v !== null && v !== "") return v; }
+  const low = {}; Object.keys(o).forEach(k => { low[k.toLowerCase()] = o[k]; });
+  for (const k of keys) { const v = low[k.toLowerCase()]; if (v !== undefined && v !== null && v !== "") return v; }
+  return undefined;
+}
+function ppArr(v) { if (Array.isArray(v)) return v; if (v && typeof v === "object") return Object.values(v); return []; }
+function ppChannel(O, raw) {
+  const txt = [ppPick(O, ["order_from", "online_order_from", "sub_order_type", "order_source", "source", "platform", "aggregator", "channel"]),
+    ppPick(raw, ["order_from", "source"]), ppPick(O, ["order_type"])].filter(Boolean).join(" ").toLowerCase();
+  if (/zomato/.test(txt)) return "Zomato";
+  if (/swiggy/.test(txt)) return "Swiggy";
+  if (/magic\s*pin/.test(txt)) return "Magicpin";
+  if (/ondc/.test(txt)) return "ONDC";
+  if (/dine|table/.test(txt)) return "Dine In";
+  if (/pick|take\s*away|parcel|counter/.test(txt)) return "Takeaway";
+  if (/deliver|home/.test(txt)) return "Delivery";
+  return String(ppPick(O, ["order_type"]) || "Other").trim() || "Other";
+}
+function ppPayment(O) {
+  const p = String(ppPick(O, ["payment_type", "payment_mode", "payment_method", "payment"]) || "").trim();
+  const l = p.toLowerCase();
+  if (!l) return "Other";
+  if (/part/.test(l)) return "Part Payment";
+  if (/cash/.test(l)) return "Cash";
+  if (/card|credit card|debit/.test(l)) return "Card";
+  if (/upi|gpay|google|phonepe|paytm|bhim|qr/.test(l)) return "UPI";
+  if (/due|credit|udhar/.test(l)) return "Due";
+  if (/online|zomato|swiggy|prepaid|wallet/.test(l)) return "Online";
+  return p;
+}
+function ppNormalize(raw, fallbackDate) {
+  const O = raw.Order || raw.order || raw;
+  const created = String(ppPick(O, ["created_on", "order_time", "created_at", "date_time", "createdOn"]) || "");
+  const date = normalizeDate(ppPick(O, ["order_date", "date", "bill_date"])) || normalizeDate(created.slice(0, 10)) || fallbackDate || "";
+  const tm = created.match(/(\d{1,2}):(\d{2})/);
+  const items = ppArr(raw.OrderItem || raw.OrderItems || raw.order_items || raw.items || O.OrderItem).map(it => {
+    const qty = num(ppPick(it, ["quantity", "qty"])) || 0;
+    const price = num(ppPick(it, ["price", "rate", "unit_price"]));
+    const total = num(ppPick(it, ["total", "amount", "item_total"])) || round2(price * qty);
+    return {
+      name: String(ppPick(it, ["name", "item_name", "itemname"]) || "Item").trim(),
+      category: String(ppPick(it, ["category_name", "category", "categoryname"]) || "").trim(),
+      qty, price, total, tax: num(ppPick(it, ["total_tax", "tax"])), discount: num(ppPick(it, ["total_discount", "discount"])),
+      variation: String(ppPick(it, ["variation_name", "variation"]) || "").trim(),
+    };
+  });
+  const itemsSum = round2(items.reduce((s, i) => s + i.total, 0));
+  const statusTxt = String(ppPick(O, ["status", "order_status", "bill_status"]) || "Success");
+  const cust = raw.Customer || raw.customer || {};
+  return {
+    id: String(ppPick(O, ["orderID", "order_id", "orderId", "id"]) || ""),
+    invoice: String(ppPick(O, ["customer_invoice_id", "invoice_no", "bill_no", "billNo"]) || ""),
+    date, time: tm ? pad2(tm[1]) + ":" + tm[2] : "", hour: tm ? Number(tm[1]) : -1,
+    channel: ppChannel(O, raw), orderType: String(ppPick(O, ["order_type"]) || "").trim(),
+    payment: ppPayment(O), paymentRaw: String(ppPick(O, ["payment_type", "payment_mode"]) || ""),
+    status: statusTxt, cancelled: /cancel|void|reject|delete|refund/i.test(statusTxt),
+    total: num(ppPick(O, ["total", "grand_total", "net_amount", "order_total", "bill_amount"])) || itemsSum,
+    core: num(ppPick(O, ["core_total", "sub_total", "subtotal", "item_total"])) || itemsSum,
+    tax: num(ppPick(O, ["tax_total", "total_tax", "tax"])),
+    discount: num(ppPick(O, ["discount_total", "total_discount", "discount"])),
+    delivery: num(ppPick(O, ["delivery_charges", "delivery_charge"])),
+    packing: num(ppPick(O, ["packaging_charge", "container_charges", "packing_charges"])),
+    service: num(ppPick(O, ["service_charge"])),
+    roundOff: num(ppPick(O, ["round_off", "roundoff"])),
+    table: String(ppPick(O, ["table_no", "table"]) || ""),
+    biller: String(ppPick(O, ["biller", "biller_name", "assignee"]) || ""),
+    customer: String(ppPick(cust, ["name", "customer_name"]) || ""),
+    items,
+  };
+}
+
+// --- 3) Ek din ke orders (memory cache: aaj 60 sec, kal 10 min, purane 6 ghante) ---
+const PP_MEM = new Map();     // date → { t, orders }
+const PP_INFLIGHT = new Map();
+function ppTTL(d) { const t = istTodayISO(); if (d >= t) return 55000; if (d === istTodayISO(-1)) return 10 * 60000; return 6 * 3600000; }
+function ppStore(d, list) { PP_MEM.set(d, { t: Date.now(), orders: list }); if (PP_MEM.size > 120) PP_MEM.delete(PP_MEM.keys().next().value); }
+async function ppOrdersForDate(d, force) {
+  const hit = PP_MEM.get(d);
+  if (!force && hit && Date.now() - hit.t < ppTTL(d)) return hit.orders;
+  if (PP_INFLIGHT.has(d)) return PP_INFLIGHT.get(d);
+  const job = (async () => {
+    try {
+      const raw = await ppCall(d);
+      const all = raw.map(r => ppNormalize(r, d));
+      const byDate = {};
+      all.forEach(o => { const k = o.date || d; (byDate[k] = byDate[k] || []).push(o); });
+      // dedupe (Petpooja ka orderID roz 1 se shuru ho sakta hai — isliye date+id)
+      const dedupe = (arr) => { const seen = new Map(); arr.forEach((o, i) => seen.set(o.id ? o.date + ":" + o.id : "i" + i, o)); return [...seen.values()]; };
+      const mine = dedupe(byDate[d] || []);
+      ppStore(d, mine);
+      // D-1 bhi saath aaya — agar uska cache purana/khaali hai to bhar do (ek call bachti hai)
+      const prev = addDaysISO(d, -1);
+      if (byDate[prev] && byDate[prev].length) { const ph = PP_MEM.get(prev); if (!ph || Date.now() - ph.t > ppTTL(prev) || ph.orders.length < byDate[prev].length) ppStore(prev, dedupe(byDate[prev])); }
+      PP_STATE.lastOkAt = toISTISO(new Date());
+      return mine;
+    } catch (e) {
+      PP_STATE.lastError = e.message; PP_STATE.lastErrorAt = toISTISO(new Date());
+      if (hit) return hit.orders; // purana data dikhao, khali screen nahi
+      throw e;
+    } finally { PP_INFLIGHT.delete(d); }
+  })();
+  PP_INFLIGHT.set(d, job);
+  return job;
+}
+
+// --- 4) Hisaab: channel / payment / hour / item / category / din ---
+function ppSummarize(orders, from, to) {
+  const valid = orders.filter(o => !o.cancelled), cancelled = orders.filter(o => o.cancelled);
+  const add = (map, k, amt) => { if (!map[k]) map[k] = { orders: 0, amount: 0 }; map[k].orders++; map[k].amount = round2(map[k].amount + amt); };
+  const byChannel = {}, byPayment = {}, byBiller = {}, byDay = {}, items = {}, cats = {};
+  const byHour = Array.from({ length: 24 }, (_, h) => ({ hour: h, orders: 0, amount: 0 }));
+  let net = 0, core = 0, tax = 0, disc = 0, delivery = 0, packing = 0, service = 0;
+  valid.forEach(o => {
+    net += o.total; core += o.core; tax += o.tax; disc += o.discount; delivery += o.delivery; packing += o.packing; service += o.service;
+    add(byChannel, o.channel, o.total); add(byPayment, o.payment, o.total); if (o.biller) add(byBiller, o.biller, o.total); add(byDay, o.date, o.total);
+    if (o.hour >= 0 && o.hour < 24) { byHour[o.hour].orders++; byHour[o.hour].amount = round2(byHour[o.hour].amount + o.total); }
+    o.items.forEach(it => {
+      const k = normH(it.name + (it.variation ? " (" + it.variation + ")" : ""));
+      if (!items[k]) items[k] = { name: it.name + (it.variation ? " (" + it.variation + ")" : ""), category: it.category, qty: 0, amount: 0, orders: 0, zomato: 0, swiggy: 0 };
+      items[k].qty = round3(items[k].qty + it.qty); items[k].amount = round2(items[k].amount + it.total); items[k].orders++;
+      if (o.channel === "Zomato") items[k].zomato = round3(items[k].zomato + it.qty);
+      if (o.channel === "Swiggy") items[k].swiggy = round3(items[k].swiggy + it.qty);
+      const c = it.category || "Other";
+      if (!cats[c]) cats[c] = { name: c, qty: 0, amount: 0 };
+      cats[c].qty = round3(cats[c].qty + it.qty); cats[c].amount = round2(cats[c].amount + it.total);
+    });
+  });
+  // range ke saare din (0 wale bhi) — trend chart ke liye
+  if (from && to) for (let d = from, n = 0; d <= to && n < 400; d = addDaysISO(d, 1), n++) if (!byDay[d]) byDay[d] = { orders: 0, amount: 0 };
+  const sortObj = (m) => Object.keys(m).map(k => Object.assign({ name: k }, m[k])).sort((a, b) => b.amount - a.amount);
+  return {
+    orders: valid.length, netSales: round2(net), itemTotal: round2(core), tax: round2(tax), discount: round2(disc),
+    deliveryCharges: round2(delivery), packingCharges: round2(packing), serviceCharges: round2(service),
+    avgBill: valid.length ? round2(net / valid.length) : 0,
+    cancelledOrders: cancelled.length, cancelledAmount: round2(cancelled.reduce((s, o) => s + o.total, 0)),
+    byChannel: sortObj(byChannel), byPayment: sortObj(byPayment), byBiller: sortObj(byBiller), byHour,
+    byDay: Object.keys(byDay).sort().map(k => Object.assign({ date: k }, byDay[k])),
+    topItems: Object.values(items).sort((a, b) => b.amount - a.amount),
+    byCategory: Object.values(cats).sort((a, b) => b.amount - a.amount),
+  };
+}
+
+// --- 5) App ke liye: range ka poora data ---
+async function handleGetPetpoojaSales(p) {
+  await requireRole(p, PP_SALES_ROLES, "Petpooja sales dekhna");
+  if (!ppConfigured()) return { configured: false };
+  const today = istTodayISO();
+  let from = normalizeDate(p.from) || today, to = normalizeDate(p.to) || from;
+  if (from > to) { const t = from; from = to; to = t; }
+  if (to > today) to = today;
+  const days = []; for (let d = from; d <= to && days.length < 62; d = addDaysISO(d, 1)) days.push(d);
+  const force = p.force === true || p.force === "true";
+  // naye se purane — taaki "D maango, D-1 free" wala fayda mile
+  const results = {}; const errors = [];
+  const queue = days.slice().reverse();
+  const worker = async () => {
+    while (queue.length) {
+      const d = queue.shift();
+      try { results[d] = await ppOrdersForDate(d, force && d === today); }
+      catch (e) { errors.push({ date: d, error: e.message }); results[d] = []; }
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+  const all = days.reduce((a, d) => a.concat(results[d] || []), []);
+  const summary = ppSummarize(all, from, to);
+  const orders = all.slice().sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time)).slice(0, Number(p.limit) || 400)
+    .map(o => ({ id: o.id, invoice: o.invoice, date: o.date, time: o.time, channel: o.channel, orderType: o.orderType, payment: o.payment, status: o.status, cancelled: o.cancelled, total: o.total, tax: o.tax, discount: o.discount, table: o.table, biller: o.biller, customer: o.customer, items: o.items.map(i => ({ name: i.name + (i.variation ? " (" + i.variation + ")" : ""), qty: i.qty, total: i.total })) }));
+  return { configured: true, from, to, today, fetchedAt: toISTISO(new Date()), summary, orders, totalOrderRows: all.length, errors, status: PP_STATE };
+}
+
+// Hero ke liye debug: Petpooja asal mein kya bhej raha hai (field names verify karne ke liye)
+async function handleGetPetpoojaRaw(p) {
+  await requireRole(p, ["Hero"], "Petpooja raw data");
+  const d = normalizeDate(p.date) || istTodayISO();
+  const raw = await ppCall(d);
+  return { date: d, count: raw.length, sample: raw.slice(0, Math.min(3, Number(p.n) || 2)), normalized: raw.slice(0, 2).map(r => ppNormalize(r, d)), webhookSamples: PP_STATE.webhookSamples.slice(0, 3) };
+}
+
+// --- 6) Google Sheet mein pakka record: din ka summary (har sync) + orders (din band hone ke baad ek baar) ---
+const PPDAY_HDR = ["Date", "Orders", "Net Sales", "Item Total", "Tax", "Discount", "Cancelled Orders", "Cancelled Amount", "Avg Bill",
+  "Dine In", "Takeaway", "Delivery", "Zomato", "Swiggy", "Zomato Orders", "Swiggy Orders", "Other Channels",
+  "Cash", "Card", "UPI", "Online", "Other Payment", "Top Items", "Last Synced", "Orders Saved"];
+const PPORD_HDR = ["Date", "Time", "Order ID", "Invoice", "Channel", "Order Type", "Payment", "Status", "Item Total", "Tax", "Discount", "Total", "Items", "Table", "Biller", "Customer"];
+function ppDayRow(d, s) {
+  const ch = (n) => { const x = s.byChannel.find(c => c.name === n); return x ? x : { orders: 0, amount: 0 }; };
+  const pay = (n) => { const x = s.byPayment.find(c => c.name === n); return x ? x.amount : 0; };
+  const known = ["Dine In", "Takeaway", "Delivery", "Zomato", "Swiggy"], knownPay = ["Cash", "Card", "UPI", "Online"];
+  return {
+    "Date": d, "Orders": s.orders, "Net Sales": s.netSales, "Item Total": s.itemTotal, "Tax": s.tax, "Discount": s.discount,
+    "Cancelled Orders": s.cancelledOrders, "Cancelled Amount": s.cancelledAmount, "Avg Bill": s.avgBill,
+    "Dine In": ch("Dine In").amount, "Takeaway": ch("Takeaway").amount, "Delivery": ch("Delivery").amount,
+    "Zomato": ch("Zomato").amount, "Swiggy": ch("Swiggy").amount, "Zomato Orders": ch("Zomato").orders, "Swiggy Orders": ch("Swiggy").orders,
+    "Other Channels": round2(s.byChannel.filter(c => !known.includes(c.name)).reduce((a, c) => a + c.amount, 0)),
+    "Cash": pay("Cash"), "Card": pay("Card"), "UPI": pay("UPI"), "Online": pay("Online"),
+    "Other Payment": round2(s.byPayment.filter(c => !knownPay.includes(c.name)).reduce((a, c) => a + c.amount, 0)),
+    "Top Items": s.topItems.slice(0, 10).map(i => `${i.name} x${i.qty}`).join(", "),
+    "Last Synced": toISTISO(new Date()),
+  };
+}
+async function ppSyncDay(d, finalize) {
+  return withLock("ppsync:" + d, async () => {
+    const orders = await ppOrdersForDate(d, true);
+    const s = ppSummarize(orders, d, d);
+    await ensureSheet(S.PPDAY, PPDAY_HDR);
+    const rows = await readRange(S.PPDAY, "A1:A", "FORMATTED_VALUE");
+    let rowNum = 0;
+    for (let i = 1; i < rows.length; i++) if (normalizeDate(rows[i][0]) === d) { rowNum = i + 1; break; }
+    const obj = ppDayRow(d, s);
+    if (rowNum) await writeByHeaders(S.PPDAY, rowNum, obj); else rowNum = await appendByHeaders(S.PPDAY, obj);
+    let saved = 0;
+    if (finalize && orders.length) {
+      const cur = await readRowByHeaders(S.PPDAY, rowNum, ["Orders Saved"]);
+      if (String(cur["Orders Saved"] || "") !== "Yes") {
+        await ensureSheet(S.PPORD, PPORD_HDR);
+        const list = orders.slice().sort((a, b) => a.time.localeCompare(b.time));
+        await appendRows(S.PPORD, list.map(o => [o.date, o.time, o.id, o.invoice, o.channel, o.orderType, o.payment, o.status, o.core, o.tax, o.discount, o.total,
+          o.items.map(i => `${i.qty}x ${i.name}${i.variation ? " (" + i.variation + ")" : ""}`).join("; ").slice(0, 4000), o.table, o.biller, o.customer]));
+        await writeByHeaders(S.PPDAY, rowNum, { "Orders Saved": "Yes" });
+        saved = list.length;
+      }
+    }
+    PP_STATE.lastSyncAt = toISTISO(new Date()); PP_STATE.lastSyncDate = d;
+    return { date: d, orders: s.orders, netSales: s.netSales, savedOrders: saved };
+  });
+}
+// Background: har 2 min aaj ka sync; subah 4 baje ke baad pichhle 3 din "final" karke orders sheet mein
+let PP_FINAL_DONE = "";
+async function ppBackgroundTick() {
+  if (!ppConfigured()) return { skipped: "not configured" };
+  const out = [];
+  const today = istTodayISO(), h = istHour();
+  try { out.push(await ppSyncDay(today, false)); } catch (e) { PP_STATE.lastError = e.message; PP_STATE.lastErrorAt = toISTISO(new Date()); }
+  if (h < 4) { try { out.push(await ppSyncDay(istTodayISO(-1), false)); } catch (e) {} }   // raat 12-4: late bills kal mein judte hain
+  if (h >= 4 && PP_FINAL_DONE !== today) {
+    for (let i = 3; i >= 1; i--) { try { out.push(await ppSyncDay(istTodayISO(-i), true)); } catch (e) { console.error("PP finalize:", e.message); } }
+    PP_FINAL_DONE = today;
+  }
+  return out;
+}
+let PP_TICK_RUNNING = false;
+function ppTickSafe() {
+  if (PP_TICK_RUNNING) return Promise.resolve({ skipped: "already running" });
+  PP_TICK_RUNNING = true;
+  return ppBackgroundTick().catch(e => ({ error: e.message })).finally(() => { PP_TICK_RUNNING = false; });
+}
+// Cron (cron-job.org) ya Petpooja webhook ke liye — Render free plan so jata hai, isliye bahar se jagao
+async function handlePpSync(p) {
+  if (PP.SYNC_KEY && String(p.key || "") !== PP.SYNC_KEY) {
+    await requireRole(p, PP_SALES_ROLES, "Petpooja sync");
+  }
+  if (p.date) return ppSyncDay(normalizeDate(p.date), p.finalize === true || p.finalize === "true");
+  return ppTickSafe();
+}
+// Petpooja "push/webhook" (agar Petpooja enable kare): har naye bill par turant aaj ka data refresh
+let PP_WEBHOOK_TIMER = null;
+app.post("/petpooja/webhook", (req, res) => {
+  const key = String(req.query.key || req.headers["x-pp-key"] || "");
+  if (PP.SYNC_KEY && key !== PP.SYNC_KEY) return res.status(401).json({ success: "0", message: "bad key" });
+  PP_STATE.webhookHits++; PP_STATE.lastWebhookAt = toISTISO(new Date());
+  try { PP_STATE.webhookSamples.unshift(JSON.stringify(req.body).slice(0, 3000)); PP_STATE.webhookSamples.length = Math.min(PP_STATE.webhookSamples.length, 5); } catch (e) {}
+  PP_MEM.delete(istTodayISO());
+  clearTimeout(PP_WEBHOOK_TIMER);
+  PP_WEBHOOK_TIMER = setTimeout(() => { ppSyncDay(istTodayISO(), false).catch(e => console.error("PP webhook sync:", e.message)); }, 8000);
+  res.json({ success: "1", message: "received" });
+});
+
 // =================== ACTION DISPATCHER ===================
 async function dispatchAction(action, payload) {
   let data;
@@ -1657,6 +1984,9 @@ async function dispatchAction(action, payload) {
   else if (action === "deleteStaff") data = await handleDeleteStaff(payload);
   else if (action === "runAutoPO") data = await runAutoPOForAll();
   else if (action === "checkAutoPOForItem") data = await checkAndCreateAutoPO(payload.itemName);
+  else if (action === "getPetpoojaSales") data = await handleGetPetpoojaSales(payload);
+  else if (action === "getPetpoojaRaw") data = await handleGetPetpoojaRaw(payload);
+  else if (action === "ppSync") data = await handlePpSync(payload);
   else if (action === "uploadPhoto") data = { url: await uploadPhotoToDrive(payload.photoBase64, payload.userId || "photo", payload.name || "photo") };
   else data = { note: "Action not implemented yet: " + action };
   return data;
@@ -1695,4 +2025,10 @@ app.listen(PORT, () => {
   // Server start hote hi Product Master + Demand headers ready
   cached("products", readProducts).then(() => console.log("Product columns:", JSON.stringify(PCOL))).catch(e => console.error("Warmup:", e.message));
   ensureDemandHeaders();
+  // 🆕 Petpooja: start par ek baar + har PP_POLL_MS (default 2 min) aaj ka sales sheet mein
+  if (ppConfigured()) {
+    console.log("Petpooja sync ON — restID " + PP.REST_ID + ", har " + Math.round(PP.POLL_MS / 1000) + " sec");
+    setTimeout(ppTickSafe, 15000);
+    setInterval(ppTickSafe, PP.POLL_MS).unref();
+  } else console.log("Petpooja sync OFF — PP_APP_KEY / PP_APP_SECRET / PP_ACCESS_TOKEN / PP_REST_ID env set nahi hain");
 });
