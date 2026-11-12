@@ -1,4 +1,4 @@
-const express = require("express");
+aconst express = require("express");
 const { google } = require("googleapis");
 const NodeCache = require("node-cache");
 const cors = require("cors");
@@ -721,7 +721,7 @@ function wantForRole(perm) {
   else {
     want.push("myAttendance");
     if (perm === "Admin") want.push("stats", "products", "demands");
-    else if (perm === "Hero") want.push("stats", "products", "demands", "vendors");
+    else if (perm === "Hero" || perm === "Viewer") want.push("stats", "products", "demands", "vendors");
     else if (perm === "Supervisor") want.push("demands", "products", "vendors");
     else if (perm === "Cashier") want.push("products", "demands");
   }
@@ -783,7 +783,7 @@ async function buildDashboardStats() {
   const istNow = new Date(Date.now() + 5.5 * 3600000);
   const today = istNow.toISOString().slice(0, 10);
   const presentIds = new Set(attendance.filter(a => String(a.Date || "").slice(0, 10) === today && a["IN Time"]).map(a => a["User ID"]));
-  const totalStaff = staff.filter(s => s.Permission !== "Admin" && s.Permission !== "SuperAdmin" && s.Permission !== "Hero").length;
+  const totalStaff = staff.filter(s => !["Admin", "SuperAdmin", "Hero", "Viewer"].includes(String(s.Permission || "").trim())).length;
   const health = { healthy: 0, low: 0, overstock: 0 };
   const categoryStock = {};
   products.forEach(p => {
@@ -1472,6 +1472,7 @@ async function readPOBatches() {
 // "Messages" sheet apne aap banti hai: har recipient ki ek row.
 const MSG_HDR = ["Msg ID", "Timestamp", "From", "From ID", "To ID", "To Name", "Message", "Status", "Reply", "Replied At", "Seen At"];
 const MSG_SENDERS = ["Admin", "Hero", "SuperAdmin"];
+const MSG_VIEWERS = MSG_SENDERS.concat(["Viewer"]);   // Viewer sab messages dekh sakta hai, bhej nahi sakta
 async function appendRows(sheetName, rows) {
   if (!rows.length) return;
   await sheets.spreadsheets.values.append({
@@ -1505,7 +1506,7 @@ async function handleSendMessage(p) {
 async function handleGetMessages(p) {
   const role = await roleOf(p);
   const all = await cached("messages", readMessages);
-  if (MSG_SENDERS.includes(role) && !p.mine) return all.slice(0, 1000);
+  if (MSG_VIEWERS.includes(role) && !p.mine) return all.slice(0, 1000);
   const uid = String(p._uid || p.userId || "").toLowerCase().trim();
   if (!uid) return [];
   return all.filter(m => String(m["To ID"] || "").toLowerCase().trim() === uid).slice(0, 200);
@@ -1558,7 +1559,7 @@ async function handleSendComplaint(p) {
 async function handleGetComplaints(p) {
   const role = await roleOf(p);
   const all = await cached("complaints", readComplaints);
-  if (COMPLAINT_VIEWERS.includes(role)) return all.slice(0, 1500);
+  if (COMPLAINT_VIEWERS.includes(role) || role === "Viewer") return all.slice(0, 1500);
   const uid = String(p._uid || "").toLowerCase().trim();
   if (!uid) return [];
   // dusre staff ke messages kabhi nahi
@@ -1600,7 +1601,7 @@ const PP = {
   POLL_MS: Math.max(60000, Number(process.env.PP_POLL_MS) || 120000),
 };
 const PP_STATE = { lastSyncAt: "", lastSyncDate: "", lastError: "", lastErrorAt: "", lastOkAt: "", webhookHits: 0, lastWebhookAt: "", webhookSamples: [] };
-const PP_SALES_ROLES = ["Admin", "Hero"];
+const PP_SALES_ROLES = ["Admin", "Hero", "Viewer"];
 function ppConfigured() { return !!(PP.APP_KEY && PP.APP_SECRET && PP.ACCESS_TOKEN && PP.REST_ID); }
 function istTodayISO(offsetDays) { const d = new Date(Date.now() + 5.5 * 3600000 + (offsetDays || 0) * 86400000); return d.toISOString().slice(0, 10); }
 function istHour() { return new Date(Date.now() + 5.5 * 3600000).getUTCHours(); }
@@ -1890,7 +1891,7 @@ function ppTickSafe() {
 // Cron (cron-job.org) ya Petpooja webhook ke liye — Render free plan so jata hai, isliye bahar se jagao
 async function handlePpSync(p) {
   if (PP.SYNC_KEY && String(p.key || "") !== PP.SYNC_KEY) {
-    await requireRole(p, PP_SALES_ROLES, "Petpooja sync");
+    await requireRole(p, ["Admin", "Hero"], "Petpooja sync");
   }
   if (p.date) return ppSyncDay(normalizeDate(p.date), p.finalize === true || p.finalize === "true");
   return ppTickSafe();
@@ -1916,7 +1917,10 @@ async function dispatchAction(action, payload) {
   else if (action === "poll") data = await buildPoll();
   else if (action === "getProducts") data = await cached("products", readProducts);
   else if (action === "getCategories") data = [...new Set((await cached("products", readProducts)).map(p => p.Category).filter(Boolean))].sort();
-  else if (action === "getStaff") data = await cached("staff", readStaff);
+  else if (action === "getStaff") {
+    data = await cached("staff", readStaff);
+    if ((await roleOf(payload)) === "Viewer") data = data.map(s => { const o = Object.assign({}, s); delete o.Password; return o; });
+  }
   else if (action === "getVendors") data = await cached("vendors", readVendors);
   else if (action === "getDemands") data = await cached("demands", readDemands);
   else if (action === "getDashboardStats") data = await buildDashboardStats();
@@ -1999,6 +2003,8 @@ app.all("/", async (req, res) => {
   if (!action) return res.json({ ok: true, service: "Peetambra Bridge Running" });
   try {
     const isRead = /^get/.test(action) || action === "poll" || action === "login" || action === "bootstrap";
+    // 👁️ Viewer (demo) ID: sirf dekhna — koi bhi edit/save/delete/upload server par hi block
+    if (!isRead && payload._uid && (await roleOf(payload)) === "Viewer") throw new Error("👁️ Ye View-only ID hai — kuch bhi edit / save / delete nahi kar sakte.");
     const rid = (!isRead && payload._rid) ? (action + ":" + String(payload._rid)) : "";
     let data;
     if (rid) {
