@@ -2,6 +2,7 @@ const express = require("express");
 const { google } = require("googleapis");
 const NodeCache = require("node-cache");
 const cors = require("cors");
+const crypto = require("crypto");
 
 const app = express();
 app.use(cors());
@@ -23,7 +24,7 @@ const S = {
   PRODUCTS: "Product & Stock Master", ATTENDANCE: "Attendance", DEMAND: "Demand",
   PO: "Purchase Orders", STAFF: "Staff", WHLOG: "Warehouse Entry Log",
   CYLINDER: "Cylinder Entry", SETTINGS: "Settings", RATEHIST: "Rate History", MSG: "Messages", COMPLAINT: "Complaints",
-  PPDAY: "Petpooja Daily Sales", PPORD: "Petpooja Orders",
+  PPDAY: "Petpooja Daily Sales", PPORD: "Petpooja Orders", ITEMREQ: "Item Requests",
 };
 
 // =================== HELPERS ===================
@@ -227,7 +228,7 @@ async function readRowByHeaders(sheetName, row, wanted, aliases) {
 }
 
 // =================== CACHE ===================
-const TTL = { complaints: 10, messages: 10, complaints: 10, demands: 15, attendance: 20, products: 20, po: 20, po_batches: 20, mpo: 20, whlog: 20, cyl: 20, staff: 60, vendors: 60, settings: 60, ratehist: 60 };
+const TTL = { itemreq: 10, complaints: 10, messages: 10, complaints: 10, demands: 15, attendance: 20, products: 20, po: 20, po_batches: 20, mpo: 20, whlog: 20, cyl: 20, staff: 60, vendors: 60, settings: 60, ratehist: 60 };
 let DATA_VER = 1; // har write par badhta hai — frontend isse turant refresh karta hai
 async function cached(key, builder) {
   const hit = cache.get(key); if (hit !== undefined) return hit;
@@ -386,6 +387,7 @@ function buildProdCols(hdrRow) {
   C.MAX = find(x => x === "max" || x.startsWith("max "), 16);
   C.VENDOR = find(x => x.startsWith("vendor"), 17);
   C.EXPIRY = find(x => x.startsWith("expiry"), 20);
+  C.EXTRAUNITS = find(x => x.startsWith("extra unit"), undefined);   // 🆕 "box=12, tray=30" (1 box = 12 Unit) — na ho to Hero ke pehle naye unit par ban jata hai
   return C;
 }
 // 117 pcs, 1 pkt = 20 → "5 pkt + 17 pcs" (sheet mein N column "5.17")
@@ -426,8 +428,22 @@ function rowToProduct(r, rowNum, C) {
     "Expiry Date": normalizeDate(g(C.EXPIRY)),
     "Base Unit": baseUnit, "1 Stock Unit = (Base Qty)": suq,
     "Stock Type": daily ? "Daily Market" : "Stocked",
+    "Extra Units": formatExtraUnits(parseExtraUnits(g(C.EXTRAUNITS))),
   };
 }
+// 🆕 Item ke extra units: "box=12, tray=30" → [{unit:"box", factor:12}, …]  (1 box = 12 item ke Unit)
+function parseExtraUnits(v) {
+  const out = [];
+  String(v === undefined || v === null ? "" : v).split(/[,;\n]+/).forEach(part => {
+    const m = part.match(/^\s*([^=:]+?)\s*[=:]\s*([\d.]+)\s*$/);
+    if (!m) return;
+    const unit = m[1].trim().slice(0, 30), factor = Number(m[2]);
+    if (unit && factor > 0 && !out.some(x => normH(x.unit) === normH(unit))) out.push({ unit, factor: round3(factor) });
+  });
+  return out;
+}
+function formatExtraUnits(list) { return (list || []).map(x => `${x.unit}=${x.factor}`).join(", "); }
+function extraUnitOf(item, unit) { return parseExtraUnits(item["Extra Units"]).find(x => normH(x.unit) === normH(unit)) || null; }
 
 // =================== READERS ===================
 async function readStaff() { return rowsToObjects(await readRange(S.STAFF)); }
@@ -533,6 +549,7 @@ function stdSibling(u) { const s = stdOf(u); if (!s) return ""; return s[0] === 
 function allowedUnits(item) {
   const s = [];
   [item.Unit, item["Base Unit"], stdSibling(item.Unit)].forEach(u => { u = String(u || "").trim(); if (u && !s.some(x => normH(x) === normH(u) || (stdOf(x) && stdOf(u) && stdOf(x)[0] === stdOf(u)[0] && stdOf(x)[1] === stdOf(u)[1]))) s.push(u); });
+  parseExtraUnits(item["Extra Units"]).forEach(x => { if (!s.some(y => normH(y) === normH(x.unit))) s.push(x.unit); });
   return s;
 }
 // Kisi bhi unit ki qty ko item ke "Unit" mein badlo
@@ -541,6 +558,7 @@ function unitFactor(item, unit) {
   const suq = num(item["1 Stock Unit = (Base Qty)"]) || 1;
   if (!u || u === nat) return 1;
   if (u === base && base !== nat) return suq;
+  const xu = extraUnitOf(item, unit); if (xu) return xu.factor;
   const su = stdOf(u), sn = stdOf(nat), sb = stdOf(base);
   if (su && sn && su[0] === sn[0]) return su[1] / sn[1];
   if (su && sb && su[0] === sb[0] && base !== nat) return (su[1] / sb[1]) * suq;
@@ -552,7 +570,7 @@ function checkUnit(item, unit, role) {
   if (!unit) return item.Unit;
   const hit = allowed.find(u => normH(u) === normH(unit));
   if (hit) return hit;
-  if (role === "Hero") return String(unit).trim();
+  if (role === "Hero") throw new Error(`"${unit}" is item ka unit nahi hai — pehle dropdown mein "+ Naya Unit…" se banao (1 ${unit} = kitne ${item.Unit}), phir chuno.`);
   throw new Error(`"${unit}" unit "${item["Item Name (Standardized)"]}" ke liye allowed nahi — sirf ${allowed.join(" / ")}. Naya unit sirf Hero bana sakta hai.`);
 }
 // Full Pack / Loose ko total ke hisaab se adjust karna (total = Full × 1Base + Loose)
@@ -715,6 +733,7 @@ async function runAutoPOForAll() {
 }
 
 // =================== LOGIN / BOOTSTRAP / POLL / STATS ===================
+function stripPw(s) { const o = Object.assign({}, s); delete o.Password; return o; }
 function wantForRole(perm) {
   const want = [];
   if (perm === "SuperAdmin") want.push("staff", "allAttendance");
@@ -727,12 +746,67 @@ function wantForRole(perm) {
   }
   return want;
 }
-async function handleLogin(p) {
+
+const WRITE_ROLES = {
+  addStaff: ["Hero"], updateStaff: ["Hero"], deleteStaff: ["Hero"],
+  editAttendancePunch: ["Hero", "SuperAdmin"],
+  addPurchaseOrder: ["Supervisor", "Hero"], updatePOItem: ["Supervisor", "Hero"], cancelPO: ["Supervisor", "Hero"],
+  clearPOBatch: ["Supervisor", "Hero"], generatePOBatch: ["Supervisor", "Hero"], autoTagVendors: ["Supervisor", "Hero"],
+  runAutoPO: ["Supervisor", "Hero"], checkAutoPOForItem: ["Supervisor", "Hero"], setProductVendor: ["Supervisor", "Hero"], addVendor: ["Supervisor", "Hero"],
+  addDemand: ["Cashier", "Supervisor", "Hero"], editDemand: ["Cashier", "Supervisor", "Hero"], deleteDemand: ["Cashier", "Supervisor", "Hero"],
+  saveDemandFeedback: ["Cashier", "Supervisor", "Hero"], approveDemands: ["Cashier", "Supervisor", "Hero"], approveDemand: ["Cashier", "Supervisor", "Hero"],
+  rejectDemands: ["Cashier", "Supervisor", "Hero"], rejectDemand: ["Cashier", "Supervisor", "Hero"],
+  updateCylinderPrice: ["User", "Cashier", "Supervisor", "Hero"], addCylinderEntry: ["User", "Cashier", "Supervisor", "Hero"],
+};
+// =================== 🔐 LOGIN TOKEN (har request par pehchaan) ===================
+// Login par server ek signed token deta hai — app use phone mein rakhta hai aur har request ke saath bhejta hai.
+// Server sirf token se user maanta hai (_uid / userId jo app bheje wo nahi). Token ke andar password ka "nishaan" hai:
+// password badla ya staff hataya → us user ke saare tokens turant bekaar. Koi table/sheet nahi — Render restart par bhi chalega.
+// Env (optional): AUTH_SECRET (na ho to service-account se bana leta hai), AUTH_DAYS (default 30)
+const AUTH_SECRET = (process.env.AUTH_SECRET || "").trim() || crypto.createHash("sha256").update("pfz-auth|" + (process.env.GOOGLE_SERVICE_ACCOUNT || "") + "|" + (process.env.SHEET_ID || "")).digest("hex");
+const AUTH_DAYS = Math.max(1, Number(process.env.AUTH_DAYS) || 30);
+function b64u(buf) { return Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
+function hmac(txt) { return crypto.createHmac("sha256", AUTH_SECRET).update(txt).digest(); }
+function pwMark(user, password) { return b64u(hmac("pw|" + String(user).toLowerCase().trim() + "|" + String(password).trim())).slice(0, 16); }
+function makeToken(staffRow) {
+  const body = b64u(JSON.stringify({ u: String(staffRow.User).trim(), p: pwMark(staffRow.User, staffRow.Password), e: Date.now() + AUTH_DAYS * 86400000 }));
+  return body + "." + b64u(hmac("t|" + body));
+}
+function authErr(msg) { return Object.assign(new Error(msg), { auth: true }); }
+async function verifyToken(token) {
+  const t = String(token || "");
+  const dot = t.indexOf(".");
+  if (!t || dot < 1) throw authErr("Login zaroori hai — dobara login karo.");
+  const body = t.slice(0, dot), sig = Buffer.from(t.slice(dot + 1));
+  const good = Buffer.from(b64u(hmac("t|" + body)));
+  if (sig.length !== good.length || !crypto.timingSafeEqual(sig, good)) throw authErr("Login sahi nahi hai — dobara login karo.");
+  let d; try { d = JSON.parse(Buffer.from(body.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")); } catch (e) { throw authErr("Login sahi nahi hai — dobara login karo."); }
+  if (!(d.e > Date.now())) throw authErr("Login purana ho gaya — dobara login karo.");
   const staff = await cached("staff", readStaff);
-  const match = staff.find(r => String(r.User || "").toLowerCase().trim() === String(p.userId).toLowerCase().trim() && String(r.Password || "").trim() === String(p.password).trim());
-  if (!match) throw new Error("Invalid User ID or Password");
-  const result = { userId: match.User, name: match.Name, designation: match.Designation, shift: match["Shift Timing"], permission: String(match.Permission || "").trim() };
-  try { result.bootstrap = await handleBootstrap({ want: wantForRole(result.permission), userId: result.userId }); }
+  const me = staff.find(r => String(r.User || "").toLowerCase().trim() === String(d.u).toLowerCase().trim());
+  if (!me) throw authErr("Ye ID ab Staff list mein nahi hai.");
+  if (pwMark(me.User, me.Password) !== d.p) throw authErr("Password badal gaya hai — naye password se login karo.");
+  return me;
+}
+// Galat password baar-baar: ek ID par 15 min mein 8 galat try → 15 min ke liye ruk jao
+const LOGIN_FAILS = new Map();
+function loginGuard(userId) {
+  const k = String(userId || "").toLowerCase().trim(), now = Date.now();
+  const f = (LOGIN_FAILS.get(k) || []).filter(t => now - t < 15 * 60000);
+  LOGIN_FAILS.set(k, f);
+  if (f.length >= 8) throw new Error("Bahut baar galat password — 15 minute baad try karo.");
+  return () => { f.push(now); LOGIN_FAILS.set(k, f); };
+}
+
+async function handleLogin(p) {
+  const fail = loginGuard(p.userId);
+  cache.del("staff"); // naya password / naya staff turant chale
+  const staff = await cached("staff", readStaff);
+  const match = staff.find(r => String(r.User || "").toLowerCase().trim() === String(p.userId).toLowerCase().trim() && String(r.Password || "").trim() !== "" && String(r.Password || "").trim() === String(p.password).trim());
+  if (!match) { fail(); throw new Error("Invalid User ID or Password"); }
+  LOGIN_FAILS.delete(String(p.userId || "").toLowerCase().trim());
+  const result = { userId: match.User, name: match.Name, designation: match.Designation, shift: match["Shift Timing"], permission: String(match.Permission || "").trim(), token: makeToken(match) };
+  try { result.bootstrap = await handleBootstrap({ want: wantForRole(result.permission), userId: result.userId, showPasswords: ["Hero", "SuperAdmin"].includes(result.permission) }); }
   catch (e) { console.error("Bootstrap:", e.message); result.bootstrap = {}; }
   return result;
 }
@@ -743,7 +817,7 @@ async function handleBootstrap(p) {
   const tasks = [];
   if (want.includes("products")) tasks.push(cached("products", readProducts).then(d => out.products = d).catch(() => {}));
   if (want.includes("demands")) tasks.push(cached("demands", readDemands).then(d => out.demands = d).catch(() => {}));
-  if (want.includes("staff")) tasks.push(cached("staff", readStaff).then(d => out.staff = d).catch(() => {}));
+  if (want.includes("staff")) tasks.push(cached("staff", readStaff).then(d => out.staff = p.showPasswords ? d : d.map(stripPw)).catch(() => {}));
   if (want.includes("vendors")) tasks.push(cached("vendors", readVendors).then(d => out.vendors = d).catch(() => {}));
   if (want.includes("stats")) tasks.push(buildDashboardStats().then(d => out.stats = d).catch(() => {}));
   if (want.includes("myAttendance") || want.includes("allAttendance")) {
@@ -771,7 +845,11 @@ async function buildPoll() {
   const sig = demands.length + "|" + demands.slice(0, 300).map(d => d["Demand ID"] + d.Status + d["Qty Requested"] + d["Approved Qty"] + d.Feedback + d.Rate).join(",")
     + "|" + products.map(p => p["Item Name (Standardized)"] + p["Current Stock"] + p.Rate).join(",");
   // pendingStocked/newestStocked = Supervisor ke liye (Daily Market wali demand Supervisor ko nahi dikhti)
-  return { ver: DATA_VER + "-" + hashStr(sig), pending, newest: brief(newest), pendingStocked, newestStocked: brief(newestStocked) };
+  const ireq = await cached("itemreq", readItemRequests).catch(() => []);
+  const ireqPending = ireq.filter(r => r.Status === "Pending");
+  const ireqSig = ireq.slice(0, 200).map(r => r["Req ID"] + r.Status).join(",");
+  return { ver: DATA_VER + "-" + hashStr(sig + "|" + ireqSig), pending, newest: brief(newest), pendingStocked, newestStocked: brief(newestStocked),
+    itemReqPending: ireqPending.length, newestItemReq: ireqPending[0] ? { item: ireqPending[0]["Item Name"], by: ireqPending[0]["Requested By"], forType: ireqPending[0].For } : null };
 }
 
 async function buildDashboardStats() {
@@ -954,6 +1032,12 @@ async function handleRejectDemands(p) {
         const d = await readDemandRow(row);
         const status = String(d[7] || "Pending").trim();
         if (status !== "Pending") throw new Error("Ye demand pehle hi " + status + " ho chuki hai.");
+        const it = await findProduct(String(d[3] || "").trim());
+        const daily = it && isDaily(it["Stock Type"]);
+        if (role && role !== "Hero") {
+          if (daily && role !== "Cashier") throw new Error("Daily-Market demand Cashier (ya Hero) reject karta hai.");
+          if (!daily && role !== "Supervisor") throw new Error("Stocked demand sirf Supervisor (ya Hero) reject kar sakta hai.");
+        }
         const after = await reduceProductDemand(String(d[3] || "").trim(), num(d[6]), d[5]);
         const cells = [{ row, col: 8, value: "Rejected" }, { row, col: 12, value: toISTISO(new Date()) }];
         if (by) cells.push({ row, col: 15, value: by });
@@ -1375,6 +1459,7 @@ function heroVals(f, unit) {
     BASEUNIT: f.baseUnit === undefined ? undefined : (String(f.baseUnit).trim() || unit),
     SUQ: f.suq === undefined ? undefined : (num(f.suq) || 1),
     STOCKTYPE: f.stockType === undefined ? undefined : (isDaily(f.stockType) ? "Daily Market" : "Stocked"),
+    EXTRAUNITS: f.extraUnits === undefined ? undefined : formatExtraUnits(parseExtraUnits(f.extraUnits)),
   };
 }
 async function heroCreateProduct(f, by) {
@@ -1385,7 +1470,7 @@ async function heroCreateProduct(f, by) {
     if (list.find(x => normH(x["Item Name (Standardized)"]) === normH(f.name))) throw new Error("Ye item pehle se hai: " + f.name);
     const unit = f.unit;
     const vals = heroVals(Object.assign({ openFull: 0, openLoose: 0, demand: 0, approved: 0, purchase: 0, baseUnit: unit, suq: 1, stockType: "Stocked", rateUnit: unit }, f), unit);
-    const maxIdx = Math.max(...Object.values(C));
+    const maxIdx = Math.max(...Object.values(C).filter(v => typeof v === "number"));
     const arr = new Array(maxIdx + 1).fill("");
     arr[C.SNO] = "=ROW()-1"; // sheet jaisa hi S no formula
     arr[C.NAME] = f.name;
@@ -1400,11 +1485,83 @@ async function heroCreateProduct(f, by) {
   if (out.rate !== "" && out.rate !== undefined) logRateChange(f.name, "", out.rate, out.rateUnit, "Hero: naya item", by, "");
   return out.fresh || await findProduct(f.name);
 }
+
+
+// 🆕 Extra Units ki safety: jo unit kisi demand / entry mein use ho chuka hai uska hisaab badalna ya hatana mana —
+// warna purani demand ka edit/delete/report naye hisaab se convert hoke stock galat kar dega.
+async function unitUsage(itemName, unit) {
+  const n = normH(itemName), u = normH(unit), hits = [];
+  const dem = await cached("demands", readDemands).catch(() => []);
+  const d = dem.filter(x => normH(x["Item Name"]) === n && normH(x.Unit) === u);
+  if (d.length) hits.push(d.length + " demand");
+  const wh = await cached("whlog", readWarehouseEntries).catch(() => []);
+  const w = wh.filter(x => normH(x["Item Name"]) === n && normH(x.Unit) === u);
+  if (w.length) hits.push(w.length + " stock entry");
+  const po = await cached("po", readPO).catch(() => []);
+  const pp = po.filter(x => normH(x["Item Name"]) === n && (normH(x.Unit) === u || normH(x["Add-on Unit"]) === u));
+  if (pp.length) hits.push(pp.length + " PO/purchase");
+  return hits;
+}
+async function guardExtraUnitChange(cur, f) {
+  const oldX = parseExtraUnits(cur["Extra Units"]);
+  const unitChanged = f.unit && normH(f.unit) !== normH(cur.Unit);
+  if (f.extraUnits === undefined) {
+    if (unitChanged && oldX.length) throw new Error(`Unit "${cur.Unit}" → "${f.unit}" badal rahe ho, par Extra Units (${formatExtraUnits(oldX)}) purane Unit ke hisaab se hain — unhe bhi naye Unit ke hisaab se sahi karo.`);
+    return;
+  }
+  const newX = parseExtraUnits(f.extraUnits);
+  if (unitChanged && oldX.length && formatExtraUnits(oldX) === formatExtraUnits(newX)) throw new Error(`Unit "${cur.Unit}" → "${f.unit}" badal rahe ho — Extra Units (${formatExtraUnits(oldX)}) ka hisaab bhi naye Unit ke hisaab se badlo (1 box = kitne ${f.unit}).`);
+  // naye extra unit ka naam item ke Unit / Base Unit / kg-gm jaisa na ho
+  const baseUnits = [f.unit || cur.Unit, f.baseUnit || cur["Base Unit"]].filter(Boolean);
+  for (const x of newX) {
+    if (baseUnits.some(b => normH(b) === normH(x.unit))) throw new Error(`"${x.unit}" pehle se Unit / Base Unit hai — Extra Units mein mat likho.`);
+    if (stdOf(x.unit) && baseUnits.some(b => stdOf(b) && stdOf(b)[0] === stdOf(x.unit)[0])) throw new Error(`"${x.unit}" apne aap convert hota hai (kg↔gm, ltr↔ml) — Extra Units mein mat likho.`);
+  }
+  // purana unit hataya ya hisaab badla — use hua ho to mana
+  for (const o of oldX) {
+    const nx = newX.find(x => normH(x.unit) === normH(o.unit));
+    if (nx && nx.factor === o.factor && !unitChanged) continue;
+    const used = await unitUsage(cur["Item Name (Standardized)"], o.unit);
+    if (used.length) throw new Error(`"${o.unit}" (1 = ${o.factor} ${cur.Unit}) ${used.join(", ")} mein use ho chuka hai — iska hisaab badla ya hataya to purani entries ka stock galat ho jayega. Naya hisaab chahiye to naye naam se unit banao (jaise "${o.unit} bada").`);
+  }
+}
+
+// 🆕 "Extra Units" column Product sheet mein na ho to header ke end mein bana do
+async function ensureExtraUnitsCol() {
+  let C = await getProdCols();
+  if (C.EXTRAUNITS !== undefined) return C;
+  await withLock("products", async () => {
+    const hdr = ((await readRange(S.PRODUCTS, "1:1", "FORMATTED_VALUE"))[0] || []);
+    if (hdr.some(h => normH(h).startsWith("extra unit"))) return;
+    await ensureCols(S.PRODUCTS, hdr.length + 1);
+    await batchWrite(S.PRODUCTS, [{ row: 1, col: hdr.length + 1, value: "Extra Units" }]);
+  });
+  PCOL = null; cache.del("products");
+  return getProdCols();
+}
+// Hero: kisi item ka naya unit (1 X = n Unit) — demand / purchase / approve sab dropdown mein dikhega
+async function handleHeroAddUnit(p) {
+  await requireRole(p, ["Hero"], "Naya unit banana");
+  const unit = String(p.unit || "").replace(/[=,;:]/g, " ").replace(/\s+/g, " ").trim().slice(0, 30);
+  const factor = round3(num(p.factor));
+  if (!unit) throw new Error("Unit ka naam likho");
+  if (!(factor > 0)) throw new Error("1 " + unit + " = kitne? — 0 se zyada number daalo");
+  await ensureExtraUnitsCol();
+  const item = p.row ? null : await findProduct(p.itemName);
+  if (!p.row && !item) throw new Error("Item nahi mila: " + p.itemName);
+  const { after } = await mutateProduct(p.row ? { row: Number(p.row) } : { name: item["Item Name (Standardized)"] }, (b, C) => {
+    if (allowedUnits(b).some(u => normH(u) === normH(unit)) || stdOf(unit) && allowedUnits(b).some(u => stdOf(u) && stdOf(u)[0] === stdOf(unit)[0])) throw new Error(`"${unit}" is item mein pehle se hai (ya apne aap convert hota hai).`);
+    const list = parseExtraUnits(b["Extra Units"]); list.push({ unit, factor });
+    return { [C.EXTRAUNITS]: formatExtraUnits(list) };
+  });
+  return { product: after, unit, factor };
+}
 async function handleHeroSaveProduct(p) {
   await requireRole(p, ["Hero"], "Item create/update");
   const st = await staffOf(p);
   const by = st ? st.Name : "Hero";
   const f = p.fields || {};
+  if (f.extraUnits !== undefined && String(f.extraUnits).trim() !== "") await ensureExtraUnitsCol();
   const name = String(f.name || "").trim(), category = String(f.category || "").trim(), unit = String(f.unit || "").trim();
   if (!name) throw new Error("Item ka naam likho");
   if (!category || !unit) throw new Error("Category aur Unit dono zaroori hain");
@@ -1415,6 +1572,8 @@ async function handleHeroSaveProduct(p) {
   const list = await cached("products", readProducts);
   const clash = list.find(x => normH(x["Item Name (Standardized)"]) === normH(name) && x._row !== Number(p.row));
   if (clash) throw new Error("Is naam ka item pehle se hai (row " + clash._row + ")");
+  const cur = list.find(x => x._row === Number(p.row));
+  if (cur) await guardExtraUnitChange(cur, ff);
   const res = await mutateProduct({ row: Number(p.row) }, (b, C) => {
     if (p.originalName && normH(b["Item Name (Standardized)"]) !== normH(p.originalName)) throw new Error("Sheet mein ye row badal gayi hai — page refresh karke dobara try karo.");
     const ch = { [C.NAME]: name };
@@ -1581,6 +1740,141 @@ async function handleUpdateComplaint(p) {
   await batchWrite(S.COMPLAINT, cells);
   invalidate("complaints");
   return { row, status: p.status || r[7], reply };
+}
+
+
+// =================== 🆕 NAYA ITEM REQUEST (Cashier / Supervisor → Hero approve) ===================
+// List mein item nahi hai to staff "Item Requests" sheet mein request bhejta hai.
+// Hero galti sudhaar ke approve karta hai → item Product Master mein banta hai,
+// aur qty di ho to wahi Demand / Purchase / Stock entry bhi apne aap ban jaati hai.
+const ITEMREQ_HDR = ["Req ID", "Timestamp", "Requested By", "Requester ID", "Role", "For", "Item Name", "Category", "Unit", "Stock Type",
+  "Qty", "Rate", "Expiry Date", "Notes", "Status", "Final Item Name", "Final Category", "Final Unit", "Final Stock Type", "Final Rate",
+  "Final Qty", "Hero Note", "Approved By", "Approved At", "Entry Done"];
+const ITEMREQ_REQUESTERS = ["Cashier", "Supervisor"];
+const ITEMREQ_VIEW_ALL = ["Hero", "Admin", "Viewer"];
+const ITEMREQ_FOR = { demand: "Demand", purchase: "Purchase", stock: "Stock Entry" };
+async function readItemRequests() {
+  const m = await sheetMeta();
+  if (!m[S.ITEMREQ]) return [];
+  const objs = rowsToObjects(await readRange(S.ITEMREQ, "A1:Y", "FORMATTED_VALUE"));
+  objs.forEach(o => { o.Timestamp = normalizeDateTime(o.Timestamp); o["Approved At"] = normalizeDateTime(o["Approved At"]); o.Status = o.Status || "Pending"; });
+  return objs.filter(o => o["Req ID"]).reverse();
+}
+async function handleGetItemRequests(p) {
+  const me = await staffOf(p);
+  if (!me) throw new Error("Login karo");
+  const role = String(me.Permission || "").trim();
+  const all = await cached("itemreq", readItemRequests);
+  if (ITEMREQ_VIEW_ALL.includes(role)) return all.slice(0, 1000);
+  const uid = String(me.User || "").toLowerCase().trim();
+  return all.filter(r => String(r["Requester ID"] || "").toLowerCase().trim() === uid).slice(0, 200);
+}
+async function handleAddItemRequest(p) {
+  const role = await requireRole(p, ITEMREQ_REQUESTERS, "Naye item ki request");
+  const me = await staffOf(p);
+  const name = String(p.itemName || "").replace(/\s+/g, " ").trim().slice(0, 120);
+  const category = String(p.category || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  if (!name) throw new Error("Item ka naam likho");
+  if (!category) throw new Error("Category chuno");
+  const forType = ITEMREQ_FOR[String(p.forType || "").toLowerCase()] || "Demand";
+  const existing = await findProduct(name);
+  if (existing) throw new Error(`"${existing["Item Name (Standardized)"]}" pehle se list mein hai — dropdown se chuno.`);
+  const qty = String(p.qty === undefined ? "" : p.qty).trim() === "" ? "" : num(p.qty);
+  if (qty !== "" && !(qty > 0)) throw new Error("Qty 0 se zyada honi chahiye (ya khali chhodo)");
+  const rate = String(p.rate === undefined ? "" : p.rate).trim() === "" ? "" : money(p.rate);
+  if (rate !== "" && !(rate >= 0)) throw new Error("Rate sahi nahi hai");
+  const expiry = p.expiryDate ? (normalizeDate(p.expiryDate) || "") : "";
+  const stockType = isDaily(p.stockType) ? "Daily Market" : "Stocked";
+  return withLock("itemreq", async () => {
+    await ensureSheet(S.ITEMREQ, ITEMREQ_HDR);
+    cache.del("itemreq");
+    const all = await cached("itemreq", readItemRequests);
+    const dup = all.find(r => r.Status === "Pending" && normH(r["Item Name"]) === normH(name));
+    if (dup) throw new Error(`"${name}" ki request pehle se Hero ke paas pending hai (${dup["Requested By"]}).`);
+    const id = "IR-" + Date.now() + "-" + Math.floor(Math.random() * 90 + 10);
+    const row = await appendByHeaders(S.ITEMREQ, {
+      "Req ID": id, "Timestamp": toISTISO(new Date()), "Requested By": me.Name || me.User, "Requester ID": me.User, "Role": role, "For": forType,
+      "Item Name": name, "Category": category, "Unit": String(p.unit || "").trim().slice(0, 30), "Stock Type": stockType,
+      "Qty": qty, "Rate": rate, "Expiry Date": expiry, "Notes": String(p.notes || "").trim().slice(0, 300), "Status": "Pending",
+    });
+    cache.del("itemreq"); DATA_VER++;
+    return { id, row, itemName: name, forType };
+  });
+}
+async function itemReqRow(row) {
+  row = Number(row); if (!row || row < 2) throw new Error("Invalid request");
+  const r = await readRowByHeaders(S.ITEMREQ, row, ITEMREQ_HDR);
+  if (!r["Req ID"]) throw new Error("Request nahi mili — page refresh karo");
+  return r;
+}
+async function handleApproveItemRequest(p) {
+  await requireRole(p, ["Hero"], "Item request approve");
+  const hero = await staffOf(p);
+  const f = p.fields || {};
+  return withLock("itemreq:" + p.row, async () => {
+    const r = await itemReqRow(p.row);
+    if (p.reqId && String(r["Req ID"]) !== String(p.reqId)) throw new Error("Sheet badal gayi hai — page refresh karke dobara try karo.");
+    if (String(r.Status || "Pending") !== "Pending") throw new Error("Ye request pehle hi " + r.Status + " ho chuki hai.");
+    const name = String(f.name !== undefined ? f.name : r["Item Name"]).replace(/\s+/g, " ").trim();
+    const category = String(f.category !== undefined ? f.category : r.Category).trim();
+    const unit = String(f.unit !== undefined ? f.unit : r.Unit).trim();
+    if (!name) throw new Error("Item ka naam likho");
+    if (!category || !unit) throw new Error("Category aur Unit dono zaroori hain");
+    const stockType = isDaily(f.stockType !== undefined ? f.stockType : r["Stock Type"]) ? "Daily Market" : "Stocked";
+    const rateIn = f.rate !== undefined ? f.rate : r.Rate;
+    const rate = String(rateIn === undefined || rateIn === null ? "" : rateIn).trim() === "" ? "" : money(rateIn);
+    const expiry = f.expiry !== undefined ? (normalizeDate(f.expiry) || "") : (normalizeDate(r["Expiry Date"]) || "");
+    const qtyIn = f.qty !== undefined ? f.qty : r.Qty;
+    const qty = String(qtyIn === undefined || qtyIn === null ? "" : qtyIn).trim() === "" ? 0 : num(qtyIn);
+    const by = hero ? hero.Name : "Hero";
+
+    // 1) Item Product Master mein (pehle se ho to wahi use hoga)
+    let product = await findProduct(name), created = false;
+    if (!product) {
+      const pf = { name, category, unit, stockType, rateUnit: unit, baseUnit: unit, suq: 1 };
+      if (rate !== "") pf.rate = rate;
+      if (expiry && stockType !== "Daily Market") pf.expiry = expiry;
+      if (f.vendor) pf.vendor = String(f.vendor).trim();
+      product = await heroCreateProduct(pf, by);
+      created = true;
+    }
+    const finalName = product ? product["Item Name (Standardized)"] : name;
+
+    // 2) Qty di hai to wahi entry bhi (requester ke naam se)
+    let entry = null, entryError = "";
+    const makeEntry = f.makeEntry === undefined ? qty > 0 : (f.makeEntry === true || f.makeEntry === "true");
+    if (makeEntry && qty > 0) {
+      const reqBy = String(r["Requested By"] || "");
+      try {
+        if (r.For === "Demand") {
+          entry = await handleAddDemand({ _uid: p._uid, itemName: finalName, qty, unit, raisedBy: reqBy, notes: ("Naya item (" + r["Req ID"] + ") " + String(r.Notes || "")).trim() });
+        } else {
+          entry = await addStockEntry(r.For === "Stock Entry" ? "wh" : "mp", { _uid: p._uid, itemName: finalName, qty, unit, rate: rate === "" ? "" : rate, rateUnit: unit, expiryDate: expiry, enteredBy: reqBy + " (Hero approved)" });
+        }
+      } catch (e) { entryError = e.message; }
+    }
+    await writeByHeaders(S.ITEMREQ, Number(p.row), {
+      "Status": "Approved", "Final Item Name": finalName, "Final Category": category, "Final Unit": unit, "Final Stock Type": stockType,
+      "Final Rate": rate, "Final Qty": qty || "", "Hero Note": String(f.note || "").trim().slice(0, 300), "Approved By": by,
+      "Approved At": toISTISO(new Date()), "Entry Done": entry ? "Yes" : (entryError ? "Failed: " + entryError.slice(0, 150) : "No"),
+    });
+    cache.del("itemreq"); invalidate("products", "demands", "dash"); DATA_VER++;
+    return { itemName: finalName, created, product: entry && entry.product ? entry.product : product, entry: !!entry, entryError, forType: r.For };
+  });
+}
+async function handleRejectItemRequest(p) {
+  await requireRole(p, ["Hero"], "Item request reject");
+  const hero = await staffOf(p);
+  return withLock("itemreq:" + p.row, async () => {
+    const r = await itemReqRow(p.row);
+    if (p.reqId && String(r["Req ID"]) !== String(p.reqId)) throw new Error("Sheet badal gayi hai — page refresh karke dobara try karo.");
+    if (String(r.Status || "Pending") !== "Pending") throw new Error("Ye request pehle hi " + r.Status + " ho chuki hai.");
+    const note = String(p.note || "").trim();
+    if (!note) throw new Error("Reject ki wajah likho (staff ko dikhegi)");
+    await writeByHeaders(S.ITEMREQ, Number(p.row), { "Status": "Rejected", "Hero Note": note.slice(0, 300), "Approved By": hero ? hero.Name : "Hero", "Approved At": toISTISO(new Date()) });
+    cache.del("itemreq"); DATA_VER++;
+    return { rejected: true };
+  });
 }
 
 // =================== 🆕 PETPOOJA SALES (POS + Zomato + Swiggy — sab orders) ===================
@@ -1890,7 +2184,7 @@ function ppTickSafe() {
 }
 // Cron (cron-job.org) ya Petpooja webhook ke liye — Render free plan so jata hai, isliye bahar se jagao
 async function handlePpSync(p) {
-  if (PP.SYNC_KEY && String(p.key || "") !== PP.SYNC_KEY) {
+  if (!PP.SYNC_KEY || String(p.key || "") !== PP.SYNC_KEY) {
     await requireRole(p, ["Admin", "Hero"], "Petpooja sync");
   }
   if (p.date) return ppSyncDay(normalizeDate(p.date), p.finalize === true || p.finalize === "true");
@@ -1919,7 +2213,7 @@ async function dispatchAction(action, payload) {
   else if (action === "getCategories") data = [...new Set((await cached("products", readProducts)).map(p => p.Category).filter(Boolean))].sort();
   else if (action === "getStaff") {
     data = await cached("staff", readStaff);
-    if ((await roleOf(payload)) === "Viewer") data = data.map(s => { const o = Object.assign({}, s); delete o.Password; return o; });
+    if (!["Hero", "SuperAdmin"].includes(await roleOf(payload))) data = data.map(stripPw);   // passwords sirf Staff Admin wale dekhein
   }
   else if (action === "getVendors") data = await cached("vendors", readVendors);
   else if (action === "getDemands") data = await cached("demands", readDemands);
@@ -1988,6 +2282,11 @@ async function dispatchAction(action, payload) {
   else if (action === "deleteStaff") data = await handleDeleteStaff(payload);
   else if (action === "runAutoPO") data = await runAutoPOForAll();
   else if (action === "checkAutoPOForItem") data = await checkAndCreateAutoPO(payload.itemName);
+  else if (action === "heroAddUnit") data = await handleHeroAddUnit(payload);
+  else if (action === "getItemRequests") data = await handleGetItemRequests(payload);
+  else if (action === "addItemRequest") data = await handleAddItemRequest(payload);
+  else if (action === "approveItemRequest") data = await handleApproveItemRequest(payload);
+  else if (action === "rejectItemRequest") data = await handleRejectItemRequest(payload);
   else if (action === "getPetpoojaSales") data = await handleGetPetpoojaSales(payload);
   else if (action === "getPetpoojaRaw") data = await handleGetPetpoojaRaw(payload);
   else if (action === "ppSync") data = await handlePpSync(payload);
@@ -2002,9 +2301,29 @@ app.all("/", async (req, res) => {
   const action = payload.action;
   if (!action) return res.json({ ok: true, service: "Peetambra Bridge Running" });
   try {
+    // 🔐 Login ke alawa har request par token zaroori; user token se hi maana jata hai
+    const cronOk = action === "ppSync" && PP.SYNC_KEY && String(payload.key || "") === PP.SYNC_KEY;
+    delete payload._uid;
+    if (action !== "login" && !cronOk) {
+      const me = await verifyToken(payload._token);
+      payload._uid = String(me.User).trim();
+      const role = String(me.Permission || "").trim();
+      // khud ki attendance sirf khud ke naam par (offline queue / shared phone mein bhi sahi insaan)
+      if (action === "markAttendance") { payload.userId = me.User; payload.name = me.Name; payload.designation = me.Designation; payload.shift = me["Shift Timing"]; }
+      if (action === "bootstrap") { payload.userId = me.User; payload.showPasswords = ["Hero", "SuperAdmin"].includes(role); }
+      // "kisne kiya" wale naam app ki jagah asli login se
+      ["raisedBy", "enteredBy", "by", "editedBy"].forEach(k => { if (payload[k] !== undefined) payload[k] = me.Name; });
+      if (payload.approvedBy !== undefined) payload.approvedBy = me.Name;
+      // 🔐 kaun kya badal sakta hai (app ke buttons jaisa hi — ab server par bhi pakka)
+      const readAct = /^get/.test(action) || action === "poll" || action === "bootstrap";
+      if (!readAct && role === "Viewer") throw new Error("👁️ Ye View-only ID hai — kuch bhi edit / save / delete nahi kar sakte.");
+      const allow = WRITE_ROLES[action];
+      if (allow && !allow.includes(role)) throw new Error(`Ye kaam (${action}) sirf ${allow.join(" / ")} kar sakta hai.`);
+    }
+    delete payload._token;
     const isRead = /^get/.test(action) || action === "poll" || action === "login" || action === "bootstrap";
     // 👁️ Viewer (demo) ID: sirf dekhna — koi bhi edit/save/delete/upload server par hi block
-    if (!isRead && payload._uid && (await roleOf(payload)) === "Viewer") throw new Error("👁️ Ye View-only ID hai — kuch bhi edit / save / delete nahi kar sakte.");
+    if (!isRead && (await roleOf(payload)) === "Viewer") throw new Error("👁️ Ye View-only ID hai — kuch bhi edit / save / delete nahi kar sakte.");
     const rid = (!isRead && payload._rid) ? (action + ":" + String(payload._rid)) : "";
     let data;
     if (rid) {
@@ -2019,7 +2338,7 @@ app.all("/", async (req, res) => {
     res.json({ ok: true, data });
   } catch (e) {
     console.error("Router error on", action, ":", e.message);
-    res.json({ ok: false, error: e.message });
+    res.json(e.auth ? { ok: false, error: e.message, auth: true } : { ok: false, error: e.message });
   }
 });
 
