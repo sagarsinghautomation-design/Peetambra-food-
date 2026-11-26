@@ -11,6 +11,11 @@ app.use(express.json({ limit: "20mb", type: ["application/json", "text/plain"] }
 
 // useClones:false — cache se data turant milta hai (copy banane ka time bachta hai)
 const cache = new NodeCache({ stdTTL: 120, checkperiod: 30, useClones: false });
+// 🆕 STALE-CACHE FIX: har key ki "generation". Koi read write se PEHLE shuru hua aur write ke BAAD khatam hua
+// (purana Pending data le kar) to wo cache mein nahi jata — pehle yahi se approve wapas Pending dikhta tha.
+const KEYGEN = {};
+const _cacheDel = cache.del.bind(cache);
+cache.del = function (k) { (Array.isArray(k) ? k : [k]).forEach(x => { KEYGEN[x] = (KEYGEN[x] || 0) + 1; }); return _cacheDel(k); };
 
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT),
@@ -232,7 +237,10 @@ const TTL = { itemreq: 10, complaints: 10, messages: 10, complaints: 10, demands
 let DATA_VER = 1; // har write par badhta hai — frontend isse turant refresh karta hai
 async function cached(key, builder) {
   const hit = cache.get(key); if (hit !== undefined) return hit;
-  const data = await builder(); cache.set(key, data, TTL[key] || 30); return data;
+  const gen = KEYGEN[key] || 0;
+  const data = await builder();
+  if ((KEYGEN[key] || 0) === gen) cache.set(key, data, TTL[key] || 30);   // beech mein write hua to purana data cache nahi hoga
+  return data;
 }
 function invalidate(...keys) { DATA_VER++; keys.forEach(k => cache.del(k)); }
 function hashStr(str) { let h = 0; for (let i = 0; i < str.length; i++) { h = (h * 31 + str.charCodeAt(i)) | 0; } return (h >>> 0).toString(36); }
@@ -986,8 +994,10 @@ async function approveOne(it, role, by) {
     if (productDelta) { try { await mutateProduct({ name: itemName }, (b, C) => ({ [C.APPROVED]: round3(b["Approved Demand Qty by supervisor"] - productDelta) })); } catch (_) {} }
     throw e;
   }
+  cache.del("demands"); DATA_VER++;   // status sheet mein likh gaya — turant fresh dikhe
+  // Auto-PO ab background mein (approve ko slow nahi karta) — app is result ko use nahi karta
   let autoPO = null;
-  if (!daily) { try { const r = await checkAndCreateAutoPO(itemName); if (r && r.created) autoPO = r; } catch (e) { console.error("AutoPO:", e.message); } }
+  if (!daily) { checkAndCreateAutoPO(itemName).catch(e => console.error("AutoPO:", e.message)); }
   return { autoPO, result: { row, ok: true, approvedQty: approved, unit, rate, amount, approvedBy: by, approvedAt: nowIso, warning, product } };
 }
 
