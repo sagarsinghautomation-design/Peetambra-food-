@@ -1,8 +1,8 @@
-// P Food'z Cafe — service worker (v11)
+// P Food'z Cafe — service worker (v12)
 // HTML: NETWORK-FIRST — har baar naya version, offline hone par hi cache se
 // Baaki same-origin files: stale-while-revalidate
 // Cross-origin (Render backend API, Google Fonts, Chart.js): kabhi cache nahi
-const CACHE_NAME = 'pfp-cafe-shell-v11';   // version badalte hi purana cache auto-delete
+const CACHE_NAME = 'pfp-cafe-shell-v12';   // version badalte hi purana cache auto-delete
 const APP_SHELL = ['./', './index.html', './manifest.json'];
 
 self.addEventListener('install', (event) => {
