@@ -306,7 +306,7 @@ const SWR_ACTIONS = new Set(['getProducts','getDemands','getStaff','getVendors',
 const STALE_MS = 4000;             // older than this -> revalidate in background
 const LS_CACHE_KEY = 'pfp_cache_v4';
 // 🆕 Naya version deploy hote hi purana saara cache apne aap saaf
-const APP_VERSION = '2026-11-12.1';
+const APP_VERSION = '2026-11-26.1';
 (function autoClearOldCache() {
   try {
     if (localStorage.getItem('pfp_app_ver') !== APP_VERSION) {
@@ -371,7 +371,7 @@ async function rawCall(action, payload, opts) {
         const busy = /SERVER_BUSY|too many|Service invoked|try again/i.test(json.error || '');
         throw Object.assign(new Error((json.error || 'Request failed').replace(/^SERVER_BUSY:\s*/, '')), { retry: busy, server: true });
       }
-      return json.data;
+      return action === 'getDemands' ? applyApprovedOverlay(json.data) : json.data;
     } catch (e) {
       lastErr = e;
       const network = e.name === 'AbortError' || !e.server;
@@ -431,8 +431,25 @@ function userBusy() {
 }
 // 🆕 Abhi-abhi daali demand server list mein aane tak (max 5 min) list mein bani rahe
 let LOCAL_DEMANDS = [];
+// 🆕 Approve/Reject ho chuki demand ko server ka purana (stale) "Pending" jawab wapas Pending na kar sake:
+// approve karte hi yaha note hota hai; server jab khud Approved/Rejected dikha de tab hat jata hai (max 3 min).
+const APPROVED_OVERLAY = {};
+function applyApprovedOverlay(list) {
+  if (!Array.isArray(list)) return list;
+  const now = Date.now();
+  Object.keys(APPROVED_OVERLAY).forEach(k => { if (now - APPROVED_OVERLAY[k].at > 3 * 60 * 1000) delete APPROVED_OVERLAY[k]; });
+  if (!Object.keys(APPROVED_OVERLAY).length) return list;
+  list.forEach(d => {
+    const o = APPROVED_OVERLAY[d._row];
+    if (!o || normNameKey(d['Item Name']) !== o.item) return;
+    if ((d['Status'] || 'Pending') === 'Pending') Object.assign(d, o.patch);
+    else delete APPROVED_OVERLAY[d._row];
+  });
+  return list;
+}
+function normNameKey(s) { return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim(); }
 function withLocalDemands(list) {
-  list = Array.isArray(list) ? list.slice() : [];
+  list = applyApprovedOverlay(Array.isArray(list) ? list.slice() : []);
   const ids = new Set(list.map(d => d['Demand ID']).filter(Boolean));
   const rows = new Set(list.map(d => d._row));
   LOCAL_DEMANDS = LOCAL_DEMANDS.filter(l => Date.now() - l._localAt < 5 * 60 * 1000 && !(l['Demand ID'] && ids.has(l['Demand ID'])) && !(l._row > 0 && rows.has(l._row) && list.find(d => d._row === l._row && d['Item Name'] === l['Item Name'])));
@@ -2546,6 +2563,7 @@ function rejectDemandRow(row) {
     const undo = [];
     rows.forEach(r => {
       const d = localMarkDemand(r, { Status: 'Rejected', 'Approved By': STATE.user.name + ' (' + STATE.user.permission + ')', 'Approved At': new Date().toISOString() });
+      if (d) APPROVED_OVERLAY[r] = { item: normNameKey(d['Item Name']), at: Date.now(), patch: { Status: 'Rejected', 'Approved By': d['Approved By'], 'Approved At': d['Approved At'] } };
       if (d) { undo.push({ row: r, d }); localAdjustProduct(d['Item Name'], { [PROD_FIELD.DEMAND]: -Number(d['Qty Requested']) }); }
     });
     renderDemand();
@@ -2554,9 +2572,9 @@ function rejectDemandRow(row) {
     try {
       const r = await api('rejectDemands', { rows, approvedBy: STATE.user.name, role: STATE.user.permission });
       const failed = (r.results || []).filter(x => !x.ok);
-      if (failed.length) { toast(failed[0].error, 'error'); invalidateApiCache(); rerenderCurrent(); }
+      if (failed.length) { rows.forEach(r => delete APPROVED_OVERLAY[r]); toast(failed[0].error, 'error'); invalidateApiCache(); rerenderCurrent(); }
     } catch (e) {
-      rows.forEach(r => localMarkDemand(r, { Status: 'Pending' }));
+      rows.forEach(r => { delete APPROVED_OVERLAY[r]; localMarkDemand(r, { Status: 'Pending' }); });
       toast(e.message + ' — demand wapas list mein aa gayi', 'error'); invalidateApiCache(); renderDemand();
     }
   });
@@ -2602,6 +2620,7 @@ async function approveDemandRow(row) {
   const items = [{ row, approvedQty, ...(unitOverride ? { unit: unitOverride } : {}), ...(remarks ? { feedback: remarks } : {}), ...(isDailyMarket ? { rate, amount } : {}) }];
   const d = localMarkDemand(row, { Status: 'Approved', ...(isDailyMarket ? { Rate: rate, Amount: amount } : {}), 'Approved Qty': approvedQty, 'Approved At': new Date().toISOString(), 'Approved By': STATE.user.name + ' (' + STATE.user.permission + ')', ...(unitOverride ? { Unit: unitOverride } : {}), ...(remarks ? { Feedback: remarks, 'Feedback At': new Date().toISOString() } : {}) });
   if (d && !isDailyMarket) localAdjustProduct(d['Item Name'], { [PROD_FIELD.APPROVED]: approvedQty });
+  if (d) APPROVED_OVERLAY[row] = { item: normNameKey(d['Item Name']), at: Date.now(), patch: { Status: 'Approved', ...(isDailyMarket ? { Rate: rate, Amount: amount } : {}), 'Approved Qty': approvedQty, 'Approved At': d['Approved At'], 'Approved By': d['Approved By'], ...(unitOverride ? { Unit: unitOverride } : {}), ...(remarks ? { Feedback: remarks, 'Feedback At': d['Feedback At'] } : {}) } };
   renderDemand();                                   // instant -> row is green
   LAST_PENDING_DEMAND_COUNT = Math.max(0, (LAST_PENDING_DEMAND_COUNT || 1) - 1); setDemandNavBadge(LAST_PENDING_DEMAND_COUNT);
   toast('Demand approve ho gayi ✔');
@@ -2609,6 +2628,7 @@ async function approveDemandRow(row) {
     const r = await api('approveDemands', { items, approvedBy: STATE.user.name, role: STATE.user.permission });
     const failed = (r.results || []).filter(x => !x.ok);
     if (failed.length) {
+      delete APPROVED_OVERLAY[row];
       const dd = localMarkDemand(row, { Status: 'Pending', 'Approved Qty': '', ...(unitOverride ? { Unit: d0['Unit'] } : {}) });
       if (dd && !isDailyMarket) localAdjustProduct(dd['Item Name'], { [PROD_FIELD.APPROVED]: -approvedQty });
       toast(failed[0].error, 'error');
@@ -2619,6 +2639,7 @@ async function approveDemandRow(row) {
     }
     invalidateApiCache(); rerenderCurrent();
   } catch (e) {
+    delete APPROVED_OVERLAY[row];
     const dd = localMarkDemand(row, { Status: 'Pending', 'Approved Qty': '', ...(unitOverride ? { Unit: d0['Unit'] } : {}) });
     if (dd && !isDailyMarket) localAdjustProduct(dd['Item Name'], { [PROD_FIELD.APPROVED]: -approvedQty });
     toast(e.message + ' — demand wapas list mein aa gayi', 'error'); invalidateApiCache(); renderDemand();
