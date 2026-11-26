@@ -2340,7 +2340,11 @@ function demandInRange(d, keepPending) {
   if (DEMAND_RANGE.mode === 'all') return true;
   if (DEMAND_RANGE.mode === 'custom') return (!DEMAND_RANGE.from || k >= DEMAND_RANGE.from) && (!DEMAND_RANGE.to || k <= DEMAND_RANGE.to);
   const c = new Date(); c.setHours(0,0,0,0); c.setDate(c.getDate() - 3);
-  return k >= localDateKey(c);
+  const lim = localDateKey(c);
+  if (k >= lim) return true;
+  // 🆕 purani demand aaj approve/reject hui ho to wo bhi (green) dikhe — sirf banne ki date se na chhupe
+  const at = d['Approved At'] ? new Date(d['Approved At']) : null;
+  return !!(at && !isNaN(at.getTime()) && localDateKey(at) >= lim);
 }
 function demandRangeLabel() {
   if (DEMAND_RANGE.mode === 'all') return 'Poori history';
